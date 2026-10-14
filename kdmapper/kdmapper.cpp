@@ -6,6 +6,7 @@
 #include "intel_driver.hpp"
 #include "nt.hpp"
 #include "portable_executable.hpp"
+#include "overlay.hpp"
 
 struct ImportSite {
 	uint32_t offset;
@@ -477,7 +478,10 @@ void DestroyHeaderEnhanced(void* local_image, DWORD headerSize) {
 	}
 }
 
-ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool free, bool destroyHeader, AllocationMode mode, bool PassAllocationAddressAsFirstParam, mapCallback callback, NTSTATUS* exitCode) {
+static overlay::OverlayTarget g_persistent_overlay = {};
+static bool g_overlay_active = false;
+
+ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool free, bool destroyHeader, AllocationMode mode, bool PassAllocationAddressAsFirstParam, mapCallback callback, NTSTATUS* exitCode, const std::string& preferred_host) {
 
 	const PIMAGE_NT_HEADERS64 nt_headers = portable_executable::GetNtHeaders(data);
 
@@ -505,8 +509,30 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 	uint32_t kernel_alloc_size = image_size + trampoline_space;
 
 	ULONG64 kernel_image_base = 0;
-	if (mode == AllocationMode::AllocateIndependentPages)
-	{
+	overlay::OverlayTarget overlay_target = {};
+	bool using_overlay = false;
+
+	if (mode == AllocationMode::OverlayIntoHostDriver) {
+		uint32_t overlay_needed = nt_headers->OptionalHeader.SizeOfImage + trampoline_space + 0x400;
+		bool found;
+		if (!preferred_host.empty())
+			found = overlay::FindOverlayTargetNamed(preferred_host, overlay_needed, overlay_target);
+		else
+			found = overlay::FindOverlayTarget(overlay_needed, overlay_target);
+		if (!found) {
+			VirtualFree(local_image_base, 0, MEM_RELEASE);
+			return 0;
+		}
+
+		if (!overlay::PrepareSection(overlay_target)) {
+			VirtualFree(local_image_base, 0, MEM_RELEASE);
+			return 0;
+		}
+
+		kernel_image_base = overlay_target.section_vaddr;
+		using_overlay = true;
+	}
+	else if (mode == AllocationMode::AllocateIndependentPages) {
 		kernel_image_base = vdrv::MmAllocateIndependentPagesEx(kernel_alloc_size);
 	}
 	else {
@@ -533,7 +559,7 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		}
 
 		ULONG64 realBase = kernel_image_base;
-		if (destroyHeader) {
+		if (destroyHeader && !using_overlay) {
 			kernel_image_base -= TotalVirtualHeaderSize;
 		}
 
@@ -566,12 +592,21 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		WipeRemainingDirectories(local_image_base);
 		WipeSectionNames(local_image_base);
 
-		if (destroyHeader) {
+		if (destroyHeader && !using_overlay) {
 			DestroyHeaderEnhanced(local_image_base, TotalVirtualHeaderSize);
 		}
 
 		uint32_t write_size = image_size + ((tramp_used + 0xF) & ~0xF);
-		if (!vdrv::WriteMemory(realBase, (PVOID)((uintptr_t)local_image_base + (destroyHeader ? TotalVirtualHeaderSize : 0)), write_size)) {
+		PVOID write_src;
+		if (using_overlay) {
+			write_src = (PVOID)local_image_base;
+			write_size = nt_headers->OptionalHeader.SizeOfImage + ((tramp_used + 0xF) & ~0xF);
+		}
+		else {
+			write_src = (PVOID)((uintptr_t)local_image_base + (destroyHeader ? TotalVirtualHeaderSize : 0));
+		}
+
+		if (!vdrv::WriteMemory(realBase, write_src, write_size)) {
 			kernel_image_base = realBase;
 			break;
 		}
@@ -627,6 +662,13 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		if (exitCode)
 			*exitCode = status;
 
+		if (using_overlay) {
+			g_persistent_overlay = std::move(overlay_target);
+			g_overlay_active = true;
+			VirtualFree(local_image_base, 0, MEM_RELEASE);
+			return realBase;
+		}
+
 		if (free) {
 			bool free_status = false;
 
@@ -644,6 +686,11 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 
 	VirtualFree(local_image_base, 0, MEM_RELEASE);
 
+	if (using_overlay) {
+		overlay::RestoreSection(overlay_target);
+		return 0;
+	}
+
 	bool free_status = false;
 
 	if (mode == AllocationMode::AllocateIndependentPages)
@@ -652,4 +699,16 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		free_status = vdrv::FreePool(kernel_image_base);
 
 	return 0;
+}
+
+bool kdmapper::GetActiveOverlay(overlay::OverlayTarget& out) {
+	if (!g_overlay_active)
+		return false;
+	out = g_persistent_overlay;
+	return true;
+}
+
+void kdmapper::ClearActiveOverlay() {
+	g_overlay_active = false;
+	g_persistent_overlay = {};
 }

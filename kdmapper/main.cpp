@@ -45,8 +45,20 @@ int wmain(const int argc, wchar_t** argv) {
 
 	bool free = paramExists(argc, argv, L"free") > 0;
 	bool poolMode = paramExists(argc, argv, L"pool") > 0;
+	bool overlayMode = paramExists(argc, argv, L"overlay") > 0;
 	bool passAllocationPtr = paramExists(argc, argv, L"PassAllocationPtr") > 0;
 	bool copyHeader = paramExists(argc, argv, L"copy-header") > 0;
+
+	std::wstring preferredHostW = getParamValue(argc, argv, L"host");
+	std::string preferredHost;
+	if (!preferredHostW.empty()) {
+		int wlen = (int)preferredHostW.size();
+		int alen = WideCharToMultiByte(CP_ACP, 0, preferredHostW.c_str(), wlen, nullptr, 0, nullptr, nullptr);
+		if (alen > 0) {
+			preferredHost.resize(alen);
+			WideCharToMultiByte(CP_ACP, 0, preferredHostW.c_str(), wlen, &preferredHost[0], alen, nullptr, nullptr);
+		}
+	}
 
 	std::wstring vulnPath = getParamValue(argc, argv, L"vuln");
 
@@ -92,12 +104,16 @@ int wmain(const int argc, wchar_t** argv) {
 		return -1;
 	}
 
-	kdmapper::AllocationMode mode = poolMode
-		? kdmapper::AllocationMode::AllocatePool
-		: kdmapper::AllocationMode::AllocateIndependentPages;
+	kdmapper::AllocationMode mode;
+	if (overlayMode)
+		mode = kdmapper::AllocationMode::OverlayIntoHostDriver;
+	else if (poolMode)
+		mode = kdmapper::AllocationMode::AllocatePool;
+	else
+		mode = kdmapper::AllocationMode::AllocateIndependentPages;
 
 	NTSTATUS exitCode = 0;
-	if (!kdmapper::MapDriver(raw_image.data(), 0, 0, free, !copyHeader, mode, passAllocationPtr, nullptr, &exitCode)) {
+	if (!kdmapper::MapDriver(raw_image.data(), 0, 0, free, !copyHeader, mode, passAllocationPtr, nullptr, &exitCode, preferredHost)) {
 		vdrv::Unload();
 		return -1;
 	}
