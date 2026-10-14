@@ -60,27 +60,8 @@ int wmain(const int argc, wchar_t** argv) {
 		}
 	}
 
-	std::wstring vulnPath = getParamValue(argc, argv, L"vuln");
-
-	if (vulnPath.empty()) {
-		wchar_t exePath[MAX_PATH];
-		GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-		std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
-		vulnPath = (exeDir / ENCW(L"WDTKernel.sys")).wstring();
-	}
-
-	if (!std::filesystem::exists(vulnPath))
-		return -1;
-
-	vdrv::vulnerableDriverPath = vulnPath;
-
-	int vulnIdx = paramExists(argc, argv, L"vuln");
-	int vulnValIdx = (vulnIdx > 0 && vulnIdx + 1 < argc) ? vulnIdx + 1 : -1;
-
 	int drvIndex = -1;
 	for (int i = 1; i < argc; i++) {
-		if (i == vulnIdx || i == vulnValIdx)
-			continue;
 		if (std::filesystem::path(argv[i]).extension().string().compare(".sys") == 0) {
 			drvIndex = i;
 			break;

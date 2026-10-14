@@ -8,18 +8,17 @@
 
 namespace vdrv
 {
-	constexpr ULONG32 IOCTL_PHYS_READ_DWORD       = 0x9C412400;
-	constexpr ULONG32 IOCTL_PHYS_READ_WORD        = 0x9C412404;
-	constexpr ULONG32 IOCTL_PHYS_READ_BYTE        = 0x9C412408;
-	constexpr ULONG32 IOCTL_PHYS_WRITE_DWORD      = 0x9C41240C;
-	constexpr ULONG32 IOCTL_PHYS_WRITE_WORD       = 0x9C412410;
-	constexpr ULONG32 IOCTL_PHYS_WRITE_BYTE       = 0x9C412414;
-	constexpr ULONG32 IOCTL_PHYS_READ_DWORD_BULK  = 0x9C412418;
-	constexpr ULONG32 IOCTL_PHYS_READ_WORD_BULK   = 0x9C41241C;
-	constexpr ULONG32 IOCTL_PHYS_READ_BYTE_BULK   = 0x9C412420;
-	constexpr ULONG32 IOCTL_PHYS_WRITE_DWORD_BULK = 0x9C412424;
-	constexpr ULONG32 IOCTL_PHYS_WRITE_WORD_BULK  = 0x9C412428;
-	constexpr ULONG32 IOCTL_PHYS_WRITE_BYTE_BULK  = 0x9C41242C;
+	constexpr ULONG32 IOCTL_ASUSIO_MAP             = 0xA040A480;
+	constexpr ULONG32 IOCTL_ASUSIO_UNMAP           = 0xA0402450;
+	constexpr ULONG32 IOCTL_ASUSIO_REGISTER_TRUSTED = 0xA040A490;
+
+	struct WINIO_PHYSICAL_MEMORY_INFO {
+		ULONG_PTR ViewSize;
+		ULONG_PTR BusAddress;
+		HANDLE    SectionHandle;
+		PVOID     BaseAddress;
+		PVOID     ReferencedObject;
+	};
 
 	struct StubEntry {
 		uint64_t kaddr;
@@ -31,34 +30,19 @@ namespace vdrv
 	extern ULONG64 ntoskrnlPhysBase;
 	extern ULONG32 ntoskrnlImageSize;
 	extern bool runtimeReady;
-	extern ULONG32 loadedDriverTimestamp;
-	extern std::wstring vulnerableDriverPath;
-	extern std::wstring loadedSymlinkName;
 	extern bool g_stubPoolReady;
 	extern std::vector<StubEntry> g_stubPool;
-
-	HANDLE OpenDeviceHandle();
-	void CloseDeviceHandle();
 
 	bool PhysicalRead(uint64_t physical_address, void* buffer, uint64_t size);
 	bool PhysicalWrite(uint64_t physical_address, const void* buffer, uint64_t size);
 	bool ScanForNtoskrnlPhysBase();
 
-	bool ClearPiDDBCacheTable();
-	bool ExAcquireResourceExclusiveLite(PVOID Resource, BOOLEAN wait);
-	bool ExReleaseResourceLite(PVOID Resource);
-	BOOLEAN RtlDeleteElementGenericTableAvl(PVOID Table, PVOID Buffer);
-	PVOID RtlLookupElementGenericTableAvl(nt::PRTL_AVL_TABLE Table, PVOID Buffer);
-	nt::PiDDBCacheEntry* LookupEntry(nt::PRTL_AVL_TABLE PiDDBCacheTable, ULONG timestamp, const wchar_t* name);
 	PVOID ResolveRelativeAddress(_In_ PVOID Instruction, _In_ ULONG OffsetOffset, _In_ ULONG InstructionSize);
 	NTSTATUS AcquireDebugPrivilege();
 
 	uintptr_t FindPatternAtKernel(uintptr_t dwAddress, uintptr_t dwLen, BYTE* bMask, const char* szMask);
 	uintptr_t FindSectionAtKernel(const char* sectionName, uintptr_t modulePtr, PULONG size);
 	uintptr_t FindPatternInSectionAtKernel(const char* sectionName, uintptr_t modulePtr, BYTE* bMask, const char* szMask);
-
-	bool ClearKernelHashBucketList();
-	bool ClearWdFilterDriverList();
 
 	bool IsRunning();
 	NTSTATUS Load();
@@ -75,10 +59,6 @@ namespace vdrv
 	uint64_t AllocatePool(nt::POOL_TYPE pool_type, uint64_t size);
 	bool FreePool(uint64_t address);
 	uint64_t GetKernelModuleExport(uint64_t kernel_module_base, const std::string& function_name);
-	bool ClearMmUnloadedDrivers();
-	std::wstring GetDriverNameW();
-	std::wstring GetDriverPath();
-	std::wstring GetSymlinkName();
 
 	bool PopulateStubPool();
 	bool PickStub(uint64_t& out_kaddr, std::string& out_name);
