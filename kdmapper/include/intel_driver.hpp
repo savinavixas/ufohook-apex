@@ -1,16 +1,36 @@
 #pragma once
 #include <Windows.h>
 #include <string>
-#include <iostream>
 
 #include "utils.hpp"
 #include "nt.hpp"
 
 namespace intel_driver
 {
-	constexpr ULONG32 ioctl1 = 0x80862007;
+	constexpr ULONG32 IOCTL_PHYS_READ_DWORD       = 0x9C412400;
+	constexpr ULONG32 IOCTL_PHYS_READ_WORD        = 0x9C412404;
+	constexpr ULONG32 IOCTL_PHYS_READ_BYTE        = 0x9C412408;
+	constexpr ULONG32 IOCTL_PHYS_WRITE_DWORD      = 0x9C41240C;
+	constexpr ULONG32 IOCTL_PHYS_WRITE_WORD       = 0x9C412410;
+	constexpr ULONG32 IOCTL_PHYS_WRITE_BYTE       = 0x9C412414;
+	constexpr ULONG32 IOCTL_PHYS_READ_DWORD_BULK  = 0x9C412418;
+	constexpr ULONG32 IOCTL_PHYS_READ_WORD_BULK   = 0x9C41241C;
+	constexpr ULONG32 IOCTL_PHYS_READ_BYTE_BULK   = 0x9C412420;
+	constexpr ULONG32 IOCTL_PHYS_WRITE_DWORD_BULK = 0x9C412424;
+	constexpr ULONG32 IOCTL_PHYS_WRITE_WORD_BULK  = 0x9C412428;
+	constexpr ULONG32 IOCTL_PHYS_WRITE_BYTE_BULK  = 0x9C41242C;
+
 	extern HANDLE hDevice;
 	extern ULONG64 ntoskrnlAddr;
+	extern ULONG64 ntoskrnlPhysBase;
+	extern ULONG32 ntoskrnlImageSize;
+	extern bool runtimeReady;
+	extern ULONG32 loadedDriverTimestamp;
+	extern std::wstring vulnerableDriverPath;
+
+	bool PhysicalRead(uint64_t physical_address, void* buffer, uint64_t size);
+	bool PhysicalWrite(uint64_t physical_address, const void* buffer, uint64_t size);
+	bool ScanForNtoskrnlPhysBase();
 
 	bool ClearPiDDBCacheTable();
 	bool ExAcquireResourceExclusiveLite(PVOID Resource, BOOLEAN wait);
@@ -32,11 +52,6 @@ namespace intel_driver
 	NTSTATUS Load();
 	NTSTATUS Unload();
 
-	bool MemCopy(uint64_t destination, uint64_t source, uint64_t size);
-	bool SetMemory(uint64_t address, uint32_t value, uint64_t size);
-	bool GetPhysicalAddress(uint64_t address, uint64_t* out_physical_address);
-	uint64_t MapIoSpace(uint64_t physical_address, uint32_t size);
-	bool UnmapIoSpace(uint64_t address, uint32_t size);
 	bool ReadMemory(uint64_t address, void* buffer, uint64_t size);
 	bool WriteMemory(uint64_t address, void* buffer, uint64_t size);
 	bool WriteToReadOnlyMemory(uint64_t address, void* buffer, uint32_t size);
@@ -51,10 +66,6 @@ namespace intel_driver
 	bool ClearMmUnloadedDrivers();
 	std::wstring GetDriverNameW();
 	std::wstring GetDriverPath();
-
-	bool ClearPiDDBTimestamp();
-
-	uint64_t FindUnusedSyscallStub();
 
 	template<typename T, typename ...A>
 	bool CallKernelFunction(T* out_result, uint64_t kernel_function_address, const A ...arguments) {
