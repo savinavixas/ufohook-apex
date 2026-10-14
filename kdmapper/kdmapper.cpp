@@ -663,6 +663,36 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 			*exitCode = status;
 
 		if (using_overlay) {
+			for (int i = 0; i < nt_headers->FileHeader.NumberOfSections; i++) {
+				auto sec = &IMAGE_FIRST_SECTION(nt_headers)[i];
+				uintptr_t secAddr = kernel_image_base + sec->VirtualAddress;
+				uint32_t secSize = sec->Misc.VirtualSize;
+
+				if (secSize == 0)
+					continue;
+
+				ULONG prot = PAGE_READONLY;
+
+				if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+					prot = (sec->Characteristics & IMAGE_SCN_MEM_WRITE) ?
+						PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+				}
+				else if (sec->Characteristics & IMAGE_SCN_MEM_WRITE) {
+					prot = PAGE_READWRITE;
+				}
+				else if (sec->Characteristics & IMAGE_SCN_MEM_READ) {
+					prot = PAGE_READONLY;
+				}
+
+				vdrv::MmSetPageProtection(secAddr, secSize, prot);
+			}
+
+			if (tramp_used) {
+				uintptr_t tramp_kaddr = kernel_image_base + nt_headers->OptionalHeader.SizeOfImage;
+				uint32_t tramp_region_size = (tramp_used + 0xFFF) & ~0xFFF;
+				vdrv::MmSetPageProtection(tramp_kaddr, tramp_region_size, PAGE_EXECUTE_READ);
+			}
+
 			g_persistent_overlay = std::move(overlay_target);
 			g_overlay_active = true;
 			VirtualFree(local_image_base, 0, MEM_RELEASE);
