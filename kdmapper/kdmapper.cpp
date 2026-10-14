@@ -1,10 +1,126 @@
 #include "kdmapper.hpp"
 #include <Windows.h>
+#include <vector>
 
 #include "utils.hpp"
 #include "intel_driver.hpp"
 #include "nt.hpp"
 #include "portable_executable.hpp"
+
+struct ImportSite {
+	uint32_t offset;
+	uint64_t target_fn;
+	uint8_t  kind;
+};
+
+static size_t CountImportSites(void* raw_image) {
+	auto headers = portable_executable::GetNtHeaders(raw_image);
+	if (!headers)
+		return 0;
+
+	size_t count = 0;
+	PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(headers);
+	for (DWORD s = 0; s < headers->FileHeader.NumberOfSections; s++) {
+		if (!(sections[s].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+			continue;
+		uint32_t raw_off = sections[s].PointerToRawData;
+		uint32_t raw_sz  = sections[s].SizeOfRawData;
+		if (!raw_off || !raw_sz)
+			continue;
+		const uint8_t* base = reinterpret_cast<const uint8_t*>(raw_image) + raw_off;
+		for (uint32_t i = 0; i + 6 <= raw_sz; i++) {
+			if (base[i] == 0xFF && (base[i + 1] == 0x25 || base[i + 1] == 0x15))
+				count++;
+		}
+	}
+	return count;
+}
+
+static size_t ScanImportSitesLocal(uint8_t* local_image_base, std::vector<ImportSite>& out, uint32_t iat_va, uint32_t iat_size) {
+	auto headers = portable_executable::GetNtHeaders(local_image_base);
+	if (!headers)
+		return 0;
+
+	PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(headers);
+	for (DWORD s = 0; s < headers->FileHeader.NumberOfSections; s++) {
+		if (!(sections[s].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+			continue;
+		uint32_t start = sections[s].VirtualAddress;
+		uint32_t vend  = start + sections[s].Misc.VirtualSize;
+		for (uint32_t i = start; i + 6 <= vend; i++) {
+			uint8_t b1 = local_image_base[i];
+			uint8_t b2 = local_image_base[i + 1];
+			if (b1 != 0xFF)
+				continue;
+			if (b2 != 0x25 && b2 != 0x15)
+				continue;
+			int32_t disp = *reinterpret_cast<int32_t*>(local_image_base + i + 2);
+			int64_t target_rva64 = (int64_t)i + 6 + (int64_t)disp;
+			if (target_rva64 < 0 || target_rva64 >= 0x7FFFFFFF)
+				continue;
+			uint32_t target_rva = (uint32_t)target_rva64;
+			if (iat_va && iat_size) {
+				if (target_rva < iat_va || target_rva + 8 > iat_va + iat_size)
+					continue;
+			}
+			uint64_t iat_value = *reinterpret_cast<uint64_t*>(local_image_base + target_rva);
+			if (!iat_value)
+				continue;
+			out.push_back({ i, iat_value, b2 });
+		}
+	}
+	return out.size();
+}
+
+static bool NeutralizeImportWrappers(uint8_t* local_image_base, uint64_t kernel_image_base_virtual,
+	uint32_t image_size, uint32_t trampoline_space, uint32_t& out_used) {
+	out_used = 0;
+
+	auto headers = portable_executable::GetNtHeaders(local_image_base);
+	if (!headers)
+		return false;
+
+	uint32_t iat_va   = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].VirtualAddress;
+	uint32_t iat_size = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size;
+
+	std::vector<ImportSite> sites;
+	ScanImportSitesLocal(local_image_base, sites, iat_va, iat_size);
+	if (sites.empty())
+		return true;
+
+	const uint32_t stub_size = 12;
+	uint32_t needed = (uint32_t)sites.size() * stub_size;
+	if (needed > trampoline_space)
+		return false;
+
+	uint8_t* tramp_base_local = local_image_base + image_size;
+	uint64_t tramp_base_kernel = kernel_image_base_virtual + image_size;
+
+	for (size_t i = 0; i < sites.size(); i++) {
+		const auto& site = sites[i];
+		uint8_t* tramp = tramp_base_local + i * stub_size;
+		uint64_t tramp_kaddr = tramp_base_kernel + i * stub_size;
+
+		tramp[0]  = 0x48;
+		tramp[1]  = 0xB8;
+		*reinterpret_cast<uint64_t*>(tramp + 2) = site.target_fn;
+		tramp[10] = 0xFF;
+		tramp[11] = 0xE0;
+
+		uint8_t* site_ptr = local_image_base + site.offset;
+		uint64_t site_kaddr = kernel_image_base_virtual + site.offset;
+		int64_t rel = (int64_t)tramp_kaddr - (int64_t)(site_kaddr + 5);
+		if (rel > 0x7FFFFFFFLL || rel < -0x80000000LL)
+			return false;
+
+		site_ptr[0] = (site.kind == 0x25) ? 0xE9 : 0xE8;
+		*reinterpret_cast<int32_t*>(site_ptr + 1) = (int32_t)rel;
+		site_ptr[5] = 0x90;
+	}
+
+	out_used = needed;
+	return true;
+}
 
 void RelocateImageByDelta(portable_executable::vec_relocs relocs, const ULONG64 delta) {
 	for (const auto& current_reloc : relocs) {
@@ -244,20 +360,27 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 
 	ULONG32 image_size = nt_headers->OptionalHeader.SizeOfImage;
 
-	void* local_image_base = VirtualAlloc(nullptr, image_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+	size_t ff25_count = CountImportSites(data);
+	uint32_t trampoline_space = (uint32_t)((ff25_count + 32) * 16);
+	trampoline_space = (trampoline_space + 0xFFF) & ~0xFFF;
+
+	uint32_t alloc_virt_total = image_size + trampoline_space;
+
+	void* local_image_base = VirtualAlloc(nullptr, alloc_virt_total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 	if (!local_image_base)
 		return 0;
 
 	DWORD TotalVirtualHeaderSize = (IMAGE_FIRST_SECTION(nt_headers))->VirtualAddress;
 	image_size = image_size - (destroyHeader ? TotalVirtualHeaderSize : 0);
+	uint32_t kernel_alloc_size = image_size + trampoline_space;
 
 	ULONG64 kernel_image_base = 0;
 	if (mode == AllocationMode::AllocateIndependentPages)
 	{
-		kernel_image_base = intel_driver::MmAllocateIndependentPagesEx(image_size);
+		kernel_image_base = intel_driver::MmAllocateIndependentPagesEx(kernel_alloc_size);
 	}
 	else {
-		kernel_image_base = intel_driver::AllocatePool(nt::POOL_TYPE::NonPagedPool, image_size);
+		kernel_image_base = intel_driver::AllocatePool(nt::POOL_TYPE::NonPagedPool, kernel_alloc_size);
 	}
 
 	if (!kernel_image_base) {
@@ -292,6 +415,17 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 			break;
 		}
 
+		uint32_t tramp_used = 0;
+		if (!NeutralizeImportWrappers(
+			reinterpret_cast<uint8_t*>(local_image_base),
+			kernel_image_base,
+			nt_headers->OptionalHeader.SizeOfImage,
+			trampoline_space,
+			tramp_used)) {
+			kernel_image_base = realBase;
+			break;
+		}
+
 		WipeImportTable(local_image_base);
 		WipeRelocData(local_image_base);
 		WipeDebugDirectory(local_image_base);
@@ -304,7 +438,8 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 			DestroyHeaderEnhanced(local_image_base, TotalVirtualHeaderSize);
 		}
 
-		if (!intel_driver::WriteMemory(realBase, (PVOID)((uintptr_t)local_image_base + (destroyHeader ? TotalVirtualHeaderSize : 0)), image_size)) {
+		uint32_t write_size = image_size + ((tramp_used + 0xF) & ~0xF);
+		if (!intel_driver::WriteMemory(realBase, (PVOID)((uintptr_t)local_image_base + (destroyHeader ? TotalVirtualHeaderSize : 0)), write_size)) {
 			kernel_image_base = realBase;
 			break;
 		}
@@ -334,6 +469,12 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 
 				intel_driver::MmSetPageProtection(secAddr, secSize, prot);
 			}
+
+			if (tramp_used) {
+				uintptr_t tramp_kaddr = kernel_image_base + nt_headers->OptionalHeader.SizeOfImage;
+				uint32_t tramp_region_size = (tramp_used + 0xFFF) & ~0xFFF;
+				intel_driver::MmSetPageProtection(tramp_kaddr, tramp_region_size, PAGE_EXECUTE_READ);
+			}
 		}
 
 		const ULONG64 address_of_entry_point = kernel_image_base + nt_headers->OptionalHeader.AddressOfEntryPoint;
@@ -358,7 +499,7 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 			bool free_status = false;
 
 			if (mode == AllocationMode::AllocateIndependentPages)
-				free_status = intel_driver::MmFreeIndependentPages(realBase, image_size);
+				free_status = intel_driver::MmFreeIndependentPages(realBase, kernel_alloc_size);
 			else
 				free_status = intel_driver::FreePool(realBase);
 		}
@@ -374,7 +515,7 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 	bool free_status = false;
 
 	if (mode == AllocationMode::AllocateIndependentPages)
-		free_status = intel_driver::MmFreeIndependentPages(kernel_image_base, image_size);
+		free_status = intel_driver::MmFreeIndependentPages(kernel_image_base, kernel_alloc_size);
 	else
 		free_status = intel_driver::FreePool(kernel_image_base);
 

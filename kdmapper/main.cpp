@@ -40,8 +40,11 @@ std::wstring getParamValue(const int argc, wchar_t** argv, const wchar_t* param)
 int wmain(const int argc, wchar_t** argv) {
 	SetUnhandledExceptionFilter(SimplestCrashHandler);
 
+	if (kdmUtils::IsHvciWithBlocklistActive())
+		return -2;
+
 	bool free = paramExists(argc, argv, L"free") > 0;
-	bool indPagesMode = paramExists(argc, argv, L"indPages") > 0;
+	bool poolMode = paramExists(argc, argv, L"pool") > 0;
 	bool passAllocationPtr = paramExists(argc, argv, L"PassAllocationPtr") > 0;
 	bool copyHeader = paramExists(argc, argv, L"copy-header") > 0;
 
@@ -89,10 +92,9 @@ int wmain(const int argc, wchar_t** argv) {
 		return -1;
 	}
 
-	kdmapper::AllocationMode mode = kdmapper::AllocationMode::AllocatePool;
-
-	if (indPagesMode)
-		mode = kdmapper::AllocationMode::AllocateIndependentPages;
+	kdmapper::AllocationMode mode = poolMode
+		? kdmapper::AllocationMode::AllocatePool
+		: kdmapper::AllocationMode::AllocateIndependentPages;
 
 	NTSTATUS exitCode = 0;
 	if (!kdmapper::MapDriver(raw_image.data(), 0, 0, free, !copyHeader, mode, passAllocationPtr, nullptr, &exitCode)) {

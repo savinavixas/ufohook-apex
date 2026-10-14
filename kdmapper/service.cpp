@@ -8,6 +8,9 @@
 
 NTSTATUS service::RegisterAndStart(const std::wstring& driver_path, const std::wstring& serviceName) {
 	const static DWORD ServiceTypeKernel = 1;
+	const static DWORD StartType = 3;
+	const static DWORD ErrorControl = 1;
+	const static DWORD Tag = 0;
 	const std::wstring servicesPath = L"SYSTEM\\CurrentControlSet\\Services\\" + serviceName;
 	const std::wstring nPath = L"\\??\\" + driver_path;
 
@@ -29,6 +32,19 @@ NTSTATUS service::RegisterAndStart(const std::wstring& driver_path, const std::w
 		RegDeleteTreeW(HKEY_LOCAL_MACHINE, servicesPath.c_str());
 		return STATUS_REGISTRY_IO_FAILED;
 	}
+
+	RegSetKeyValueW(dservice, NULL, L"Start", REG_DWORD, &StartType, sizeof(DWORD));
+	RegSetKeyValueW(dservice, NULL, L"ErrorControl", REG_DWORD, &ErrorControl, sizeof(DWORD));
+	RegSetKeyValueW(dservice, NULL, L"Tag", REG_DWORD, &Tag, sizeof(DWORD));
+
+	std::wstring displayName = L"@" + serviceName + L",-100";
+	RegSetKeyValueW(dservice, NULL, L"DisplayName", REG_SZ, displayName.c_str(), (DWORD)((displayName.size() + 1) * sizeof(wchar_t)));
+
+	std::wstring description = L"Hardware diagnostics telemetry subsystem.";
+	RegSetKeyValueW(dservice, NULL, L"Description", REG_SZ, description.c_str(), (DWORD)((description.size() + 1) * sizeof(wchar_t)));
+
+	std::wstring group = L"Base";
+	RegSetKeyValueW(dservice, NULL, L"Group", REG_SZ, group.c_str(), (DWORD)((group.size() + 1) * sizeof(wchar_t)));
 
 	RegCloseKey(dservice);
 

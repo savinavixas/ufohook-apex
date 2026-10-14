@@ -3,6 +3,7 @@
 #include <iostream>
 #include <vector>
 #include <fstream>
+#include <filesystem>
 
 #include "nt.hpp"
 
@@ -16,6 +17,51 @@ std::wstring kdmUtils::GetFullTempPath() {
 		temp_directory[wcslen(temp_directory) - 1] = 0x0;
 
 	return std::wstring(temp_directory);
+}
+
+std::wstring kdmUtils::GetSystemDataPath() {
+	wchar_t buf[MAX_PATH + 1] = { 0 };
+	DWORD n = GetEnvironmentVariableW(L"ProgramData", buf, MAX_PATH);
+	if (!n || n > MAX_PATH) {
+		if (!GetWindowsDirectoryW(buf, MAX_PATH))
+			return L"";
+	}
+
+	static const wchar_t* holders[] = {
+		L"\\Microsoft\\Diagnosis",
+		L"\\Microsoft\\Windows\\Caches",
+		L"\\Microsoft\\DeviceSync\\Cache",
+		L"\\Microsoft\\Network\\Downloader",
+		L"\\Microsoft\\Windows Defender\\Scans",
+		L"\\Package Cache",
+		L"\\USOShared\\Logs"
+	};
+	std::wstring base = buf;
+	base += holders[kdmUtils::CryptoRand32() % (sizeof(holders) / sizeof(holders[0]))];
+
+	std::error_code ec;
+	std::filesystem::create_directories(base, ec);
+	return base;
+}
+
+typedef struct _SYSTEM_CODEINTEGRITY_INFORMATION {
+	ULONG Length;
+	ULONG CodeIntegrityOptions;
+} SYSTEM_CODEINTEGRITY_INFORMATION, * PSYSTEM_CODEINTEGRITY_INFORMATION;
+
+bool kdmUtils::IsHvciWithBlocklistActive() {
+	SYSTEM_CODEINTEGRITY_INFORMATION ci = { 0 };
+	ci.Length = sizeof(ci);
+	ULONG ret = 0;
+	NTSTATUS st = NtQuerySystemInformation(static_cast<SYSTEM_INFORMATION_CLASS>(103), &ci, sizeof(ci), &ret);
+	if (!NT_SUCCESS(st))
+		return false;
+
+	const ULONG CI_HVCI_ENABLED = 0x400;
+	const ULONG CI_BLOCKED_DRIVERS = 0x4000;
+	bool hvci = (ci.CodeIntegrityOptions & CI_HVCI_ENABLED) != 0;
+	bool blocklist = (ci.CodeIntegrityOptions & CI_BLOCKED_DRIVERS) != 0;
+	return hvci && blocklist;
 }
 
 bool kdmUtils::ReadFileToMemory(const std::wstring& file_path, std::vector<BYTE>* out_buffer) {

