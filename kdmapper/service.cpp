@@ -10,7 +10,6 @@ NTSTATUS service::RegisterAndStart(const std::wstring& driver_path, const std::w
 	const static DWORD ServiceTypeKernel = 1;
 	const static DWORD StartType = 3;
 	const static DWORD ErrorControl = 1;
-	const static DWORD Tag = 0;
 	const std::wstring servicesPath = L"SYSTEM\\CurrentControlSet\\Services\\" + serviceName;
 	const std::wstring nPath = L"\\??\\" + driver_path;
 
@@ -35,16 +34,35 @@ NTSTATUS service::RegisterAndStart(const std::wstring& driver_path, const std::w
 
 	RegSetKeyValueW(dservice, NULL, L"Start", REG_DWORD, &StartType, sizeof(DWORD));
 	RegSetKeyValueW(dservice, NULL, L"ErrorControl", REG_DWORD, &ErrorControl, sizeof(DWORD));
-	RegSetKeyValueW(dservice, NULL, L"Tag", REG_DWORD, &Tag, sizeof(DWORD));
 
-	std::wstring displayName = L"@" + serviceName + L",-100";
-	RegSetKeyValueW(dservice, NULL, L"DisplayName", REG_SZ, displayName.c_str(), (DWORD)((displayName.size() + 1) * sizeof(wchar_t)));
+	static const wchar_t* display_options[] = {
+		L"Hardware Diagnostics Agent",
+		L"System Telemetry Collector",
+		L"Device Health Monitor",
+		L"Hardware Resource Manager",
+		L"Peripheral Status Reporter",
+		L"System Component Service"
+	};
+	HCRYPTPROV hProv2 = 0;
+	ULONG rnd = 0;
+	if (CryptAcquireContextW(&hProv2, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+		CryptGenRandom(hProv2, sizeof(rnd), reinterpret_cast<BYTE*>(&rnd));
+		CryptReleaseContext(hProv2, 0);
+	}
+	const wchar_t* displayName = display_options[rnd % (sizeof(display_options) / sizeof(display_options[0]))];
+	DWORD dnLen = (DWORD)((wcslen(displayName) + 1) * sizeof(wchar_t));
+	RegSetKeyValueW(dservice, NULL, L"DisplayName", REG_SZ, displayName, dnLen);
 
-	std::wstring description = L"Hardware diagnostics telemetry subsystem.";
-	RegSetKeyValueW(dservice, NULL, L"Description", REG_SZ, description.c_str(), (DWORD)((description.size() + 1) * sizeof(wchar_t)));
-
-	std::wstring group = L"Base";
-	RegSetKeyValueW(dservice, NULL, L"Group", REG_SZ, group.c_str(), (DWORD)((group.size() + 1) * sizeof(wchar_t)));
+	static const wchar_t* desc_options[] = {
+		L"Provides diagnostic information for hardware components.",
+		L"Collects system telemetry for component health reporting.",
+		L"Monitors device status and reports anomalies to the kernel.",
+		L"Handles hardware resource management and configuration.",
+		L"Reports peripheral device status to the system event log."
+	};
+	const wchar_t* description = desc_options[(rnd >> 8) % (sizeof(desc_options) / sizeof(desc_options[0]))];
+	DWORD descLen = (DWORD)((wcslen(description) + 1) * sizeof(wchar_t));
+	RegSetKeyValueW(dservice, NULL, L"Description", REG_SZ, description, descLen);
 
 	RegCloseKey(dservice);
 

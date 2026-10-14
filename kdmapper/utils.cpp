@@ -44,24 +44,32 @@ std::wstring kdmUtils::GetSystemDataPath() {
 	return base;
 }
 
-typedef struct _SYSTEM_CODEINTEGRITY_INFORMATION {
-	ULONG Length;
-	ULONG CodeIntegrityOptions;
-} SYSTEM_CODEINTEGRITY_INFORMATION, * PSYSTEM_CODEINTEGRITY_INFORMATION;
-
 bool kdmUtils::IsHvciWithBlocklistActive() {
-	SYSTEM_CODEINTEGRITY_INFORMATION ci = { 0 };
-	ci.Length = sizeof(ci);
-	ULONG ret = 0;
-	NTSTATUS st = NtQuerySystemInformation(static_cast<SYSTEM_INFORMATION_CLASS>(103), &ci, sizeof(ci), &ret);
-	if (!NT_SUCCESS(st))
+	HKEY hKey = NULL;
+	DWORD hvciEnabled = 0;
+	DWORD cbData = sizeof(hvciEnabled);
+	LSTATUS lst = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+		L"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
+		0, KEY_READ | KEY_WOW64_64KEY, &hKey);
+	if (lst == ERROR_SUCCESS) {
+		RegQueryValueExW(hKey, L"Enabled", nullptr, nullptr, reinterpret_cast<LPBYTE>(&hvciEnabled), &cbData);
+		RegCloseKey(hKey);
+	}
+
+	if (!hvciEnabled)
 		return false;
 
-	const ULONG CI_HVCI_ENABLED = 0x400;
-	const ULONG CI_BLOCKED_DRIVERS = 0x4000;
-	bool hvci = (ci.CodeIntegrityOptions & CI_HVCI_ENABLED) != 0;
-	bool blocklist = (ci.CodeIntegrityOptions & CI_BLOCKED_DRIVERS) != 0;
-	return hvci && blocklist;
+	DWORD blocklistEnabled = 0;
+	cbData = sizeof(blocklistEnabled);
+	lst = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+		L"SYSTEM\\CurrentControlSet\\Control\\CI\\Config",
+		0, KEY_READ | KEY_WOW64_64KEY, &hKey);
+	if (lst == ERROR_SUCCESS) {
+		RegQueryValueExW(hKey, L"VulnerableDriverBlocklistEnable", nullptr, nullptr, reinterpret_cast<LPBYTE>(&blocklistEnabled), &cbData);
+		RegCloseKey(hKey);
+	}
+
+	return blocklistEnabled != 0;
 }
 
 bool kdmUtils::ReadFileToMemory(const std::wstring& file_path, std::vector<BYTE>* out_buffer) {

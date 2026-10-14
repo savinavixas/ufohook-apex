@@ -72,6 +72,54 @@ static size_t ScanImportSitesLocal(uint8_t* local_image_base, std::vector<Import
 	return out.size();
 }
 
+static void BuildDiversifiedStub(uint8_t* out, uint64_t target, uint32_t shape_rand) {
+	for (int i = 0; i < 16; i++)
+		out[i] = 0x90;
+
+	uint32_t shape = shape_rand % 4;
+	switch (shape) {
+	case 0: {
+		out[0]  = 0x48;
+		out[1]  = 0xB8;
+		*reinterpret_cast<uint64_t*>(out + 2) = target;
+		out[10] = 0xFF;
+		out[11] = 0xE0;
+		break;
+	}
+	case 1: {
+		out[0]  = 0x49;
+		out[1]  = 0xBA;
+		*reinterpret_cast<uint64_t*>(out + 2) = target;
+		out[10] = 0x41;
+		out[11] = 0xFF;
+		out[12] = 0xE2;
+		break;
+	}
+	case 2: {
+		out[0]  = 0x49;
+		out[1]  = 0xBB;
+		*reinterpret_cast<uint64_t*>(out + 2) = target;
+		out[10] = 0x41;
+		out[11] = 0xFF;
+		out[12] = 0xE3;
+		break;
+	}
+	case 3: {
+		uint32_t lo = static_cast<uint32_t>(target & 0xFFFFFFFF);
+		uint32_t hi = static_cast<uint32_t>(target >> 32);
+		out[0] = 0x68;
+		*reinterpret_cast<uint32_t*>(out + 1) = lo;
+		out[5] = 0xC7;
+		out[6] = 0x44;
+		out[7] = 0x24;
+		out[8] = 0x04;
+		*reinterpret_cast<uint32_t*>(out + 9) = hi;
+		out[13] = 0xC3;
+		break;
+	}
+	}
+}
+
 static bool NeutralizeImportWrappers(uint8_t* local_image_base, uint64_t kernel_image_base_virtual,
 	uint32_t image_size, uint32_t trampoline_space, uint32_t& out_used) {
 	out_used = 0;
@@ -88,7 +136,7 @@ static bool NeutralizeImportWrappers(uint8_t* local_image_base, uint64_t kernel_
 	if (sites.empty())
 		return true;
 
-	const uint32_t stub_size = 12;
+	const uint32_t stub_size = 16;
 	uint32_t needed = (uint32_t)sites.size() * stub_size;
 	if (needed > trampoline_space)
 		return false;
@@ -101,11 +149,7 @@ static bool NeutralizeImportWrappers(uint8_t* local_image_base, uint64_t kernel_
 		uint8_t* tramp = tramp_base_local + i * stub_size;
 		uint64_t tramp_kaddr = tramp_base_kernel + i * stub_size;
 
-		tramp[0]  = 0x48;
-		tramp[1]  = 0xB8;
-		*reinterpret_cast<uint64_t*>(tramp + 2) = site.target_fn;
-		tramp[10] = 0xFF;
-		tramp[11] = 0xE0;
+		BuildDiversifiedStub(tramp, site.target_fn, kdmUtils::CryptoRand32());
 
 		uint8_t* site_ptr = local_image_base + site.offset;
 		uint64_t site_kaddr = kernel_image_base_virtual + site.offset;
@@ -387,6 +431,8 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		VirtualFree(local_image_base, 0, MEM_RELEASE);
 		return 0;
 	}
+
+	intel_driver::ScopedPriorityBoost _mapBoost;
 
 	do {
 		memcpy(local_image_base, data, nt_headers->OptionalHeader.SizeOfHeaders);

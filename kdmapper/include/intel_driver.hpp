@@ -34,9 +34,6 @@ namespace intel_driver
 	extern ULONG32 loadedDriverTimestamp;
 	extern std::wstring vulnerableDriverPath;
 	extern std::wstring loadedSymlinkName;
-	extern std::vector<uint8_t> cachedNtoskrnlText;
-	extern uint64_t cachedNtoskrnlTextBase;
-	extern uint32_t cachedNtoskrnlTextSize;
 	extern bool g_stubPoolReady;
 	extern std::vector<StubEntry> g_stubPool;
 
@@ -130,14 +127,8 @@ namespace intel_driver
 			original_kernel_function[10] == 0xff && original_kernel_function[11] == 0xe0)
 			return false;
 
-		HANDLE curThread = GetCurrentThread();
-		int oldPrio = GetThreadPriority(curThread);
-		SetThreadPriority(curThread, THREAD_PRIORITY_TIME_CRITICAL);
-
-		if (!WriteToReadOnlyMemory(kernel_stub, &kernel_injected_jmp, sizeof(kernel_injected_jmp))) {
-			SetThreadPriority(curThread, oldPrio);
+		if (!WriteToReadOnlyMemory(kernel_stub, &kernel_injected_jmp, sizeof(kernel_injected_jmp)))
 			return false;
-		}
 
 		if constexpr (!call_void) {
 			using FunctionFn = T(__stdcall*)(A...);
@@ -150,8 +141,18 @@ namespace intel_driver
 			Function(arguments...);
 		}
 
-		bool ok = WriteToReadOnlyMemory(kernel_stub, original_kernel_function, sizeof(kernel_injected_jmp));
-		SetThreadPriority(curThread, oldPrio);
-		return ok;
+		return WriteToReadOnlyMemory(kernel_stub, original_kernel_function, sizeof(kernel_injected_jmp));
 	}
+
+	class ScopedPriorityBoost {
+		HANDLE th;
+		int oldPrio;
+	public:
+		ScopedPriorityBoost() : th(GetCurrentThread()), oldPrio(GetThreadPriority(GetCurrentThread())) {
+			SetThreadPriority(th, THREAD_PRIORITY_TIME_CRITICAL);
+		}
+		~ScopedPriorityBoost() {
+			SetThreadPriority(th, oldPrio);
+		}
+	};
 }
