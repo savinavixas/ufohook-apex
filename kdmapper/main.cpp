@@ -51,7 +51,7 @@ int wmain(const int argc, wchar_t** argv) {
 		wchar_t exePath[MAX_PATH];
 		GetModuleFileNameW(nullptr, exePath, MAX_PATH);
 		std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
-		vulnPath = (exeDir / L"WDTKernel.sys").wstring();
+		vulnPath = (exeDir / ENCW(L"WDTKernel.sys")).wstring();
 	}
 
 	if (!std::filesystem::exists(vulnPath))
