@@ -72,38 +72,60 @@ static size_t ScanImportSitesLocal(uint8_t* local_image_base, std::vector<Import
 	return out.size();
 }
 
-static void BuildDiversifiedStub(uint8_t* out, uint64_t target, uint32_t shape_rand) {
-	for (int i = 0; i < 16; i++)
-		out[i] = 0x90;
+static const uint8_t NOP1[] = { 0x90 };
+static const uint8_t NOP2[] = { 0x66, 0x90 };
+static const uint8_t NOP3[] = { 0x0F, 0x1F, 0x00 };
+static const uint8_t NOP4[] = { 0x0F, 0x1F, 0x40, 0x00 };
+static const uint8_t NOP5[] = { 0x0F, 0x1F, 0x44, 0x00, 0x00 };
+static const uint8_t NOP7[] = { 0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00 };
+static const uint8_t NOP9[] = { 0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
+static void FillVariedNops(uint8_t* dst, size_t len) {
+	while (len > 0) {
+		uint32_t r = kdmUtils::CryptoRand32();
+		size_t use = 0;
+		const uint8_t* src = nullptr;
+
+		if (len >= 9 && (r & 1)) { src = NOP9; use = 9; }
+		else if (len >= 7 && (r & 2)) { src = NOP7; use = 7; }
+		else if (len >= 5 && (r & 4)) { src = NOP5; use = 5; }
+		else if (len >= 4 && (r & 8)) { src = NOP4; use = 4; }
+		else if (len >= 3 && (r & 16)) { src = NOP3; use = 3; }
+		else if (len >= 2) { src = NOP2; use = 2; }
+		else { src = NOP1; use = 1; }
+
+		memcpy(dst, src, use);
+		dst += use;
+		len -= use;
+	}
+}
+
+static uint32_t WriteShape(uint8_t* out, uint64_t target, uint32_t shape_rand) {
 	uint32_t shape = shape_rand % 4;
 	switch (shape) {
-	case 0: {
+	case 0:
 		out[0]  = 0x48;
 		out[1]  = 0xB8;
 		*reinterpret_cast<uint64_t*>(out + 2) = target;
 		out[10] = 0xFF;
 		out[11] = 0xE0;
-		break;
-	}
-	case 1: {
+		return 12;
+	case 1:
 		out[0]  = 0x49;
 		out[1]  = 0xBA;
 		*reinterpret_cast<uint64_t*>(out + 2) = target;
 		out[10] = 0x41;
 		out[11] = 0xFF;
 		out[12] = 0xE2;
-		break;
-	}
-	case 2: {
+		return 13;
+	case 2:
 		out[0]  = 0x49;
 		out[1]  = 0xBB;
 		*reinterpret_cast<uint64_t*>(out + 2) = target;
 		out[10] = 0x41;
 		out[11] = 0xFF;
 		out[12] = 0xE3;
-		break;
-	}
+		return 13;
 	case 3: {
 		uint32_t lo = static_cast<uint32_t>(target & 0xFFFFFFFF);
 		uint32_t hi = static_cast<uint32_t>(target >> 32);
@@ -115,9 +137,17 @@ static void BuildDiversifiedStub(uint8_t* out, uint64_t target, uint32_t shape_r
 		out[8] = 0x04;
 		*reinterpret_cast<uint32_t*>(out + 9) = hi;
 		out[13] = 0xC3;
-		break;
+		return 14;
 	}
 	}
+	return 0;
+}
+
+static uint64_t PickJunkTarget() {
+	if (!vdrv::ntoskrnlAddr || !vdrv::ntoskrnlImageSize)
+		return 0;
+	uint32_t off = kdmUtils::CryptoRand32() % (vdrv::ntoskrnlImageSize - 16);
+	return vdrv::ntoskrnlAddr + off;
 }
 
 static bool NeutralizeImportWrappers(uint8_t* local_image_base, uint64_t kernel_image_base_virtual,
@@ -136,20 +166,75 @@ static bool NeutralizeImportWrappers(uint8_t* local_image_base, uint64_t kernel_
 	if (sites.empty())
 		return true;
 
-	const uint32_t stub_size = 16;
-	uint32_t needed = (uint32_t)sites.size() * stub_size;
+	const uint32_t slot_size = 24;
+	size_t junk_count = sites.size() / 3;
+	size_t total_slots = sites.size() + junk_count;
+
+	uint32_t needed = (uint32_t)total_slots * slot_size;
 	if (needed > trampoline_space)
 		return false;
+
+	std::vector<bool> is_real(total_slots, false);
+	std::vector<size_t> real_slot_index(sites.size(), 0);
+
+	for (size_t i = 0; i < sites.size(); i++) {
+		size_t idx;
+		for (int attempts = 0; attempts < 64; attempts++) {
+			idx = kdmUtils::CryptoRand32() % total_slots;
+			if (!is_real[idx])
+				break;
+		}
+		while (is_real[idx])
+			idx = (idx + 1) % total_slots;
+		is_real[idx] = true;
+		real_slot_index[i] = idx;
+	}
 
 	uint8_t* tramp_base_local = local_image_base + image_size;
 	uint64_t tramp_base_kernel = kernel_image_base_virtual + image_size;
 
+	std::vector<uint32_t> slot_lead_pad(total_slots, 0);
+
+	for (size_t slot = 0; slot < total_slots; slot++) {
+		uint8_t* slot_ptr = tramp_base_local + slot * slot_size;
+
+		uint32_t shape_rand = kdmUtils::CryptoRand32();
+		uint32_t max_shape_bytes = 14;
+		uint32_t max_lead = slot_size - max_shape_bytes;
+		uint32_t lead_pad = kdmUtils::CryptoRand32() % (max_lead + 1);
+		slot_lead_pad[slot] = lead_pad;
+
+		FillVariedNops(slot_ptr, lead_pad);
+
+		uint64_t target;
+		if (is_real[slot]) {
+			size_t import_idx = (size_t)-1;
+			for (size_t k = 0; k < sites.size(); k++) {
+				if (real_slot_index[k] == slot) {
+					import_idx = k;
+					break;
+				}
+			}
+			target = sites[import_idx].target_fn;
+		}
+		else {
+			target = PickJunkTarget();
+			if (!target)
+				target = sites[0].target_fn;
+		}
+
+		uint32_t shape_bytes = WriteShape(slot_ptr + lead_pad, target, shape_rand);
+
+		uint32_t trail_pad = slot_size - lead_pad - shape_bytes;
+		if (trail_pad > 0)
+			FillVariedNops(slot_ptr + lead_pad + shape_bytes, trail_pad);
+	}
+
 	for (size_t i = 0; i < sites.size(); i++) {
 		const auto& site = sites[i];
-		uint8_t* tramp = tramp_base_local + i * stub_size;
-		uint64_t tramp_kaddr = tramp_base_kernel + i * stub_size;
-
-		BuildDiversifiedStub(tramp, site.target_fn, kdmUtils::CryptoRand32());
+		size_t slot = real_slot_index[i];
+		uint32_t lead_pad = slot_lead_pad[slot];
+		uint64_t tramp_kaddr = tramp_base_kernel + slot * slot_size + lead_pad;
 
 		uint8_t* site_ptr = local_image_base + site.offset;
 		uint64_t site_kaddr = kernel_image_base_virtual + site.offset;
@@ -405,7 +490,8 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 	ULONG32 image_size = nt_headers->OptionalHeader.SizeOfImage;
 
 	size_t ff25_count = CountImportSites(data);
-	uint32_t trampoline_space = (uint32_t)((ff25_count + 32) * 16);
+	size_t total_slots_estimate = ff25_count + (ff25_count / 3) + 32;
+	uint32_t trampoline_space = (uint32_t)(total_slots_estimate * 24);
 	trampoline_space = (trampoline_space + 0xFFF) & ~0xFFF;
 
 	uint32_t alloc_virt_total = image_size + trampoline_space;
