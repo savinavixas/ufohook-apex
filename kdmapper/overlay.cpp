@@ -10,25 +10,53 @@
 namespace overlay
 {
 	static const char* kAvoidPrefixes[] = {
-		"ntoskrnl", "ntkrnl", "hal", "win32k", "ci.dll", "clipsp",
-		"EasyAntiCheat", "BEDaisy", "vgk", "WdFilter", "WdNisDrv", "SgrmAgent",
-		"ksecdd", "msrpc", "ntfs", "fastfat", "fltmgr", "cng",
+		"ntoskrnl", "ntkrnl", "hal", "win32k", "ci.dll", "clipsp", "securekernel",
+		"EasyAntiCheat", "BEDaisy", "BEClient", "vgk", "WdFilter", "WdNisDrv",
+		"SgrmAgent", "mssecflt", "AppCheck", "faceit_", "Battleye",
+		"ksecdd", "msrpc", "ntfs", "fastfat", "fltmgr", "cng", "tm",
+		"tcpip", "ndis", "netio", "afd", "http.sys",
+		"storport", "classpnp", "disk.sys", "volmgr", "mountmgr", "partmgr",
+		"MpKsl", "mpsdrv", "mpssvc",
 		"WDTKernel",
+		"RTKVHD64", "RtkAudUService",
+		"nvlddmkm", "nvidia",
+		"amdkmdag", "amdkmpfd", "atikmdag",
+		"HDAudBus", "portcls", "usbaudio",
+		"BasicRender", "BasicDisplay",
+		"intelppm",
 	};
 
-	static const char* kPreferredHosts[] = {
-		"RTKVHD64.sys",
-		"nvlddmkm.sys",
-		"amdkmdag.sys",
-		"amdkmpfd.sys",
-		"HDAudBus.sys",
-		"portcls.sys",
-		"usbaudio.sys",
-		"Classpnp.sys",
-		"storport.sys",
-		"intelppm.sys",
-		"BasicRender.sys",
-		"BasicDisplay.sys",
+	static const char* kTier1Preferred[] = {
+		"LGHUB.sys", "LGHUBUpdater.sys", "logi_joy_bus_enum.sys", "LGBusEnum.sys",
+		"LogiFilter.sys", "GRazeB.sys",
+		"RzDev_02a0.sys", "rzudd.sys", "rzpnk.sys", "rzpmgrk.sys", "rzvad.sys",
+		"iCUE.sys", "CorsairLink3Service.sys", "CorsairLink.sys",
+		"SteelSeriesService.sys", "ss_mserver.sys",
+		"EVGA_PrecisionBoost.sys",
+		"MSIAfterburner.sys", "RTCore64.sys",
+		"GPUZ.sys", "HwRwDrv.sys",
+		"HWiNFO64A.sys", "HwInfo.sys",
+		"ViGEmBus.sys", "HidGuardian.sys",
+		"VoiceMeeterVAIODrv.sys", "vbaudio_cable.sys",
+		"ElgatoGameCapture.sys", "GCMiniHD.sys",
+		"VBoxDrv.sys", "VBoxUSBMon.sys",
+		"vmnetbridge.sys", "vmnetadapter.sys", "VMwareVMCI.sys",
+		"OculusVrDrv.sys", "ValveVR.sys",
+		"XSplit.sys",
+		"MullvadWg.sys", "nordvpnlpd.sys", "ExpressVPN.sys",
+		"RivaTuner64.sys", "RtkIO64.sys",
+		"VirtualHere.sys",
+		"procexp152.sys", "procmon24.sys",
+	};
+
+	static const char* kTier2Secondary[] = {
+		"usbccgp.sys", "usbhub.sys", "USBXHCI.sys",
+		"HidClass.sys", "hidusb.sys", "mouhid.sys", "kbdhid.sys",
+		"BTHUSB.sys", "bthport.sys", "BthHfEnum.sys",
+		"wacomrouter.sys", "WacomPen.sys", "wacommousefilter.sys",
+		"srvnet.sys", "mrxsmb.sys", "mup.sys",
+		"spaceport.sys", "swenum.sys", "umbus.sys",
+		"nwifi.sys", "pacer.sys",
 	};
 
 	static const char* kPreferredSections[] = {
@@ -167,8 +195,24 @@ namespace overlay
 		return found;
 	}
 
+	static void FisherYatesShuffle(std::vector<const char*>& v) {
+		for (size_t i = v.size() - 1; i > 0; i--) {
+			size_t j = kdmUtils::CryptoRand32() % (i + 1);
+			std::swap(v[i], v[j]);
+		}
+	}
+
+	static void ShuffleIndices(std::vector<ULONG>& v) {
+		for (size_t i = v.size() - 1; i > 0; i--) {
+			size_t j = kdmUtils::CryptoRand32() % (i + 1);
+			std::swap(v[i], v[j]);
+		}
+	}
+
 	bool FindOverlayTarget(uint32_t needed_bytes, OverlayTarget& out) {
-		for (const char* host : kPreferredHosts) {
+		std::vector<const char*> tier1(kTier1Preferred, kTier1Preferred + (sizeof(kTier1Preferred) / sizeof(kTier1Preferred[0])));
+		FisherYatesShuffle(tier1);
+		for (const char* host : tier1) {
 			if (FindOverlayTargetNamed(host, needed_bytes, out))
 				return true;
 		}
@@ -198,12 +242,43 @@ namespace overlay
 		}
 
 		auto modules = static_cast<nt::PRTL_PROCESS_MODULES>(buffer);
+
+		std::vector<ULONG> candidates;
+		candidates.reserve(modules->NumberOfModules);
+		for (ULONG i = 0; i < modules->NumberOfModules; i++)
+			candidates.push_back(i);
+		ShuffleIndices(candidates);
+
 		bool found = false;
 
-		for (ULONG i = 0; i < modules->NumberOfModules; i++) {
-			if (EvaluateDriverForOverlay(modules->Modules[i], needed_bytes, out)) {
+		for (ULONG idx : candidates) {
+			const auto& mod = modules->Modules[idx];
+			std::string short_name(reinterpret_cast<const char*>(mod.FullPathName) + mod.OffsetToFileName);
+			if (ShouldAvoid(short_name))
+				continue;
+			if (short_name.size() < 5)
+				continue;
+
+			auto ends_with_sys = [](const std::string& s) {
+				return s.size() >= 4 && _stricmp(s.c_str() + s.size() - 4, ".sys") == 0;
+			};
+			if (!ends_with_sys(short_name))
+				continue;
+
+			if (EvaluateDriverForOverlay(mod, needed_bytes, out)) {
 				found = true;
 				break;
+			}
+		}
+
+		if (!found) {
+			std::vector<const char*> tier2(kTier2Secondary, kTier2Secondary + (sizeof(kTier2Secondary) / sizeof(kTier2Secondary[0])));
+			FisherYatesShuffle(tier2);
+			for (const char* host : tier2) {
+				if (FindOverlayTargetNamed(host, needed_bytes, out)) {
+					found = true;
+					break;
+				}
 			}
 		}
 
