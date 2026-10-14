@@ -62,8 +62,6 @@ namespace overlay
 	static const char* kPreferredSections[] = {
 		".data",
 		".rdata",
-		"PAGE",
-		".bss",
 	};
 
 	static bool ShouldAvoid(const std::string& name) {
@@ -120,28 +118,60 @@ namespace overlay
 			for (DWORD i = 0; i < nt_hdr->FileHeader.NumberOfSections; i++) {
 				char sec_name[9] = { 0 };
 				memcpy(sec_name, sections[i].Name, 8);
-				if (strncmp(sec_name, pref_name, pref_len) != 0)
+				if (sec_name[0] == 0)
 					continue;
 
-				if ((sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 &&
-					strncmp(sec_name, ".text", 5) == 0)
+				bool name_matches = (strlen(sec_name) == pref_len) && (strncmp(sec_name, pref_name, pref_len) == 0);
+				if (!name_matches)
 					continue;
 
-				uint32_t sec_size = sections[i].Misc.VirtualSize;
-				if (sections[i].SizeOfRawData > sec_size)
-					sec_size = sections[i].SizeOfRawData;
+				if (sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+					continue;
+				if (!(sections[i].Characteristics & IMAGE_SCN_MEM_READ))
+					continue;
 
-				if (sec_size < needed_bytes + 0x400)
+				uint32_t raw_size = sections[i].SizeOfRawData;
+				uint32_t vsize = sections[i].Misc.VirtualSize;
+
+				if (raw_size == 0)
+					continue;
+
+				uint32_t usable_size = (raw_size < vsize) ? raw_size : vsize;
+				if (usable_size < needed_bytes + 0x400)
 					continue;
 
 				uint64_t sec_va = base + sections[i].VirtualAddress;
 
+				uint32_t head_skip = 0x1000;
+				if (head_skip >= usable_size)
+					continue;
+
+				uint32_t probe_size = 0x400;
+				uint32_t sample_offset = head_skip;
+				if (sample_offset + probe_size > usable_size)
+					continue;
+
+				uint8_t sample[0x400];
+				if (!vdrv::ReadMemory(sec_va + sample_offset, sample, probe_size))
+					continue;
+
+				uint32_t zero_count = 0;
+				for (uint32_t z = 0; z < probe_size; z++)
+					if (sample[z] == 0)
+						zero_count++;
+				if ((zero_count * 100 / probe_size) < 60)
+					continue;
+
+				uint32_t overlay_usable = usable_size - head_skip;
+				if (overlay_usable < needed_bytes + 0x400)
+					continue;
+
 				out.driver_base = base;
 				out.driver_size = mod.ImageSize;
 				out.driver_name = short_name;
-				out.section_vaddr = sec_va;
-				out.section_size = sec_size;
-				out.section_rva = sections[i].VirtualAddress;
+				out.section_vaddr = sec_va + head_skip;
+				out.section_size = overlay_usable;
+				out.section_rva = sections[i].VirtualAddress + head_skip;
 				memcpy(out.section_name, sec_name, 8);
 				out.section_name[8] = 0;
 				out.original_section_characteristics = sections[i].Characteristics;
@@ -196,6 +226,8 @@ namespace overlay
 	}
 
 	static void FisherYatesShuffle(std::vector<const char*>& v) {
+		if (v.size() < 2)
+			return;
 		for (size_t i = v.size() - 1; i > 0; i--) {
 			size_t j = kdmUtils::CryptoRand32() % (i + 1);
 			std::swap(v[i], v[j]);
@@ -203,6 +235,8 @@ namespace overlay
 	}
 
 	static void ShuffleIndices(std::vector<ULONG>& v) {
+		if (v.size() < 2)
+			return;
 		for (size_t i = v.size() - 1; i > 0; i--) {
 			size_t j = kdmUtils::CryptoRand32() % (i + 1);
 			std::swap(v[i], v[j]);
