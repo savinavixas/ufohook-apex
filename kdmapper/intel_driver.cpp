@@ -394,6 +394,48 @@ static bool PatchDriverFile(const std::wstring& driver_path, ULONG32* out_timest
 	return true;
 }
 
+static void CleanupPrefetch(const std::wstring& driver_path) {
+	wchar_t winDir[MAX_PATH + 1] = { 0 };
+	if (!GetWindowsDirectoryW(winDir, MAX_PATH))
+		return;
+
+	std::wstring prefetchDir = std::wstring(winDir) + L"\\Prefetch";
+
+	std::error_code ec;
+	if (!std::filesystem::exists(prefetchDir, ec))
+		return;
+
+	std::wstring filename;
+	try {
+		filename = std::filesystem::path(driver_path).filename().wstring();
+	}
+	catch (...) {
+		return;
+	}
+	if (filename.empty())
+		return;
+
+	for (auto& ch : filename)
+		ch = (wchar_t)towupper(ch);
+
+	std::wstring pattern = prefetchDir + L"\\" + filename + L"-*.pf";
+
+	WIN32_FIND_DATAW findData = { 0 };
+	HANDLE hFind = FindFirstFileW(pattern.c_str(), &findData);
+	if (hFind == INVALID_HANDLE_VALUE)
+		return;
+
+	do {
+		if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+			continue;
+		std::wstring fullPath = prefetchDir + L"\\" + findData.cFileName;
+		SetFileAttributesW(fullPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+		DeleteFileW(fullPath.c_str());
+	} while (FindNextFileW(hFind, &findData));
+
+	FindClose(hFind);
+}
+
 static void SecureDeleteFile(const std::wstring& path) {
 	HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (hFile != INVALID_HANDLE_VALUE) {
@@ -856,8 +898,10 @@ NTSTATUS vdrv::Unload() {
 	auto status = service::StopAndRemove(GetDriverNameW());
 
 	std::wstring driver_path = GetDriverPath();
-	if (!driver_path.empty())
+	if (!driver_path.empty()) {
+		CleanupPrefetch(driver_path);
 		SecureDeleteFile(driver_path);
+	}
 
 	loadedSymlinkName.clear();
 
@@ -978,8 +1022,48 @@ bool vdrv::ClearMmUnloadedDrivers() {
 		return false;
 
 	if (us_driver_base_dll_name.Buffer && us_driver_base_dll_name.MaximumLength) {
-		auto zeroBuf = std::make_unique<uint8_t[]>(us_driver_base_dll_name.MaximumLength);
-		WriteMemory((uintptr_t)us_driver_base_dll_name.Buffer, zeroBuf.get(), us_driver_base_dll_name.MaximumLength);
+		static const wchar_t* decoys[] = {
+			L"USBHub3Loader.sys",
+			L"WudfRd.sys",
+			L"BthHfEnum.sys",
+			L"HidUsb.sys",
+			L"monitor.sys",
+			L"wmbclass.sys",
+			L"umbus.sys",
+			L"swenum.sys",
+			L"ndisuio.sys",
+			L"netbt.sys"
+		};
+		const wchar_t* chosen = nullptr;
+		size_t chosen_bytes = 0;
+		uint32_t seed = kdmUtils::CryptoRand32();
+		for (uint32_t attempt = 0; attempt < (sizeof(decoys) / sizeof(decoys[0])); attempt++) {
+			const wchar_t* candidate = decoys[(seed + attempt) % (sizeof(decoys) / sizeof(decoys[0]))];
+			size_t need = wcslen(candidate) * sizeof(wchar_t);
+			if (need + sizeof(wchar_t) <= us_driver_base_dll_name.MaximumLength) {
+				chosen = candidate;
+				chosen_bytes = need;
+				break;
+			}
+		}
+
+		auto fillBuf = std::make_unique<uint8_t[]>(us_driver_base_dll_name.MaximumLength);
+		if (chosen) {
+			memcpy(fillBuf.get(), chosen, chosen_bytes);
+		}
+		WriteMemory((uintptr_t)us_driver_base_dll_name.Buffer, fillBuf.get(), us_driver_base_dll_name.MaximumLength);
+
+		if (chosen) {
+			us_driver_base_dll_name.Length = (USHORT)chosen_bytes;
+		}
+		else {
+			us_driver_base_dll_name.Length = 0;
+		}
+
+		if (!WriteMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)))
+			return false;
+
+		return true;
 	}
 
 	us_driver_base_dll_name.Length = 0;
