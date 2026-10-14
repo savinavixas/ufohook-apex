@@ -32,7 +32,7 @@ NTSTATUS service::RegisterAndStart(const std::wstring& driver_path, const std::w
 
 	RegCloseKey(dservice);
 
-	HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+	HMODULE ntdll = GetModuleHandleA(ENC("ntdll.dll").c_str());
 	if (ntdll == NULL) {
 		RegDeleteTreeW(HKEY_LOCAL_MACHINE, servicesPath.c_str());
 		return STATUS_UNSUCCESSFUL;
@@ -60,7 +60,7 @@ NTSTATUS service::RegisterAndStart(const std::wstring& driver_path, const std::w
 }
 
 NTSTATUS service::StopAndRemove(const std::wstring& serviceName) {
-	HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+	HMODULE ntdll = GetModuleHandleA(ENC("ntdll.dll").c_str());
 	if (ntdll == NULL)
 		return STATUS_UNSUCCESSFUL;
 

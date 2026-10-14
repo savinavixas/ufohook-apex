@@ -38,9 +38,9 @@ bool FixSecurityCookie(void* local_image, ULONG64 kernel_image_base)
 	if (*(uintptr_t*)(stack_cookie) != 0x2B992DDFA232)
 		return false;
 
-	auto new_cookie = 0x2B992DDFA232 ^ GetCurrentProcessId() ^ GetCurrentThreadId();
+	uintptr_t new_cookie = ((uintptr_t)kdmUtils::CryptoRand32() << 32) | kdmUtils::CryptoRand32();
 	if (new_cookie == 0x2B992DDFA232)
-		new_cookie = 0x2B992DDFA233;
+		new_cookie++;
 
 	*(uintptr_t*)(stack_cookie) = new_cookie;
 	return true;
@@ -140,6 +140,87 @@ void WipeDebugDirectory(void* local_image) {
 	headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size = 0;
 }
 
+void WipeResourceDirectory(void* local_image) {
+	auto headers = portable_executable::GetNtHeaders(local_image);
+	if (!headers)
+		return;
+
+	DWORD rsrc_va = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress;
+	DWORD rsrc_size = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size;
+	if (rsrc_va && rsrc_size) {
+		memset(reinterpret_cast<void*>(reinterpret_cast<ULONG64>(local_image) + rsrc_va), 0, rsrc_size);
+	}
+
+	headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress = 0;
+	headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size = 0;
+}
+
+void WipeExportDirectory(void* local_image) {
+	auto headers = portable_executable::GetNtHeaders(local_image);
+	if (!headers)
+		return;
+
+	DWORD export_va = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+	DWORD export_size = headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+	if (export_va && export_size) {
+		auto export_dir = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(reinterpret_cast<ULONG64>(local_image) + export_va);
+
+		if (export_dir->Name) {
+			char* name_ptr = reinterpret_cast<char*>(reinterpret_cast<ULONG64>(local_image) + export_dir->Name);
+			memset(name_ptr, 0, strlen(name_ptr));
+		}
+
+		if (export_dir->AddressOfNames && export_dir->NumberOfNames) {
+			auto names = reinterpret_cast<DWORD*>(reinterpret_cast<ULONG64>(local_image) + export_dir->AddressOfNames);
+			for (DWORD i = 0; i < export_dir->NumberOfNames; i++) {
+				if (names[i]) {
+					char* fn_name = reinterpret_cast<char*>(reinterpret_cast<ULONG64>(local_image) + names[i]);
+					memset(fn_name, 0, strlen(fn_name));
+				}
+			}
+		}
+
+		memset(reinterpret_cast<void*>(reinterpret_cast<ULONG64>(local_image) + export_va), 0, export_size);
+	}
+
+	headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress = 0;
+	headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = 0;
+}
+
+void WipeRemainingDirectories(void* local_image) {
+	auto headers = portable_executable::GetNtHeaders(local_image);
+	if (!headers)
+		return;
+
+	const DWORD skip[] = {
+		IMAGE_DIRECTORY_ENTRY_IMPORT,
+		IMAGE_DIRECTORY_ENTRY_BASERELOC,
+		IMAGE_DIRECTORY_ENTRY_DEBUG,
+		IMAGE_DIRECTORY_ENTRY_RESOURCE,
+		IMAGE_DIRECTORY_ENTRY_EXPORT,
+		IMAGE_DIRECTORY_ENTRY_IAT,
+		IMAGE_DIRECTORY_ENTRY_EXCEPTION,
+	};
+
+	for (DWORD dir = 0; dir < IMAGE_NUMBEROF_DIRECTORY_ENTRIES; dir++) {
+		bool already_handled = false;
+		for (auto s : skip) {
+			if (dir == s) { already_handled = true; break; }
+		}
+		if (already_handled)
+			continue;
+
+		auto& entry = headers->OptionalHeader.DataDirectory[dir];
+		if (entry.VirtualAddress && entry.Size) {
+			if (dir != IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG && dir != IMAGE_DIRECTORY_ENTRY_TLS) {
+				memset(reinterpret_cast<void*>(reinterpret_cast<ULONG64>(local_image) + entry.VirtualAddress), 0, entry.Size);
+			}
+			entry.VirtualAddress = 0;
+			entry.Size = 0;
+		}
+	}
+}
+
 void DestroyHeaderEnhanced(void* local_image, DWORD headerSize) {
 	HCRYPTPROV hProv = 0;
 	if (CryptAcquireContextW(&hProv, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
@@ -214,6 +295,9 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		WipeImportTable(local_image_base);
 		WipeRelocData(local_image_base);
 		WipeDebugDirectory(local_image_base);
+		WipeResourceDirectory(local_image_base);
+		WipeExportDirectory(local_image_base);
+		WipeRemainingDirectories(local_image_base);
 		WipeSectionNames(local_image_base);
 
 		if (destroyHeader) {

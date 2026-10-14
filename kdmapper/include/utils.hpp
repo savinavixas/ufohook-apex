@@ -12,6 +12,43 @@
 #define kdmLog(content) std::wcout << content
 #endif
 
+template<size_t N, uint8_t K>
+struct EncStr {
+	char data[N];
+
+	constexpr EncStr(const char(&str)[N]) : data{} {
+		for (size_t i = 0; i < N; i++)
+			data[i] = str[i] ^ (K + (uint8_t)i);
+	}
+
+	std::string dec() const {
+		std::string out(N - 1, '\0');
+		for (size_t i = 0; i < N - 1; i++)
+			out[i] = data[i] ^ (K + (uint8_t)i);
+		return out;
+	}
+};
+
+template<size_t N, uint8_t K>
+struct EncWStr {
+	wchar_t data[N];
+
+	constexpr EncWStr(const wchar_t(&str)[N]) : data{} {
+		for (size_t i = 0; i < N; i++)
+			data[i] = str[i] ^ (K + (wchar_t)i);
+	}
+
+	std::wstring dec() const {
+		std::wstring out(N - 1, L'\0');
+		for (size_t i = 0; i < N - 1; i++)
+			out[i] = data[i] ^ (K + (wchar_t)i);
+		return out;
+	}
+};
+
+#define ENC(s) []{ constexpr EncStr<sizeof(s), (uint8_t)(__LINE__ * 7 + 0x5A)> e(s); return e; }().dec()
+#define ENCW(s) []{ constexpr EncWStr<sizeof(s)/sizeof(wchar_t), (uint8_t)(__LINE__ * 7 + 0x5A)> e(s); return e; }().dec()
+
 namespace kdmUtils
 {
 	std::wstring GetFullTempPath();

@@ -84,25 +84,24 @@ namespace intel_driver
 		if (!kernel_function_address)
 			return false;
 
-		HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+		HMODULE ntdll = GetModuleHandleA(ENC("ntdll.dll").c_str());
 		if (ntdll == 0)
 			return false;
 
 		static uint64_t kernel_stub = 0;
-		static const char* stub_name = nullptr;
+		static std::string found_stub_name;
 
 		if (!kernel_stub) {
-			static const char* candidates[] = {
-				"NtTraceControl",
-				"NtQueryDebugFilterState",
-				"NtSetDebugFilterState",
-				"NtFlushBuffersFileEx",
-				"NtAccessCheckByTypeAndAuditAlarm",
-				"NtAddAtom",
-				nullptr
+			std::string candidates[] = {
+				ENC("NtTraceControl"),
+				ENC("NtQueryDebugFilterState"),
+				ENC("NtSetDebugFilterState"),
+				ENC("NtFlushBuffersFileEx"),
+				ENC("NtAccessCheckByTypeAndAuditAlarm"),
+				ENC("NtAddAtom"),
 			};
 
-			for (int i = 0; candidates[i]; i++) {
+			for (int i = 0; i < _countof(candidates); i++) {
 				uint64_t addr = GetKernelModuleExport(intel_driver::ntoskrnlAddr, candidates[i]);
 				if (addr) {
 					uint8_t probe[16];
@@ -115,7 +114,7 @@ namespace intel_driver
 
 						if (clean) {
 							kernel_stub = addr;
-							stub_name = candidates[i];
+							found_stub_name = candidates[i];
 							break;
 						}
 					}
@@ -126,7 +125,7 @@ namespace intel_driver
 				return false;
 		}
 
-		const auto UserStub = reinterpret_cast<void*>(GetProcAddress(ntdll, stub_name));
+		const auto UserStub = reinterpret_cast<void*>(GetProcAddress(ntdll, found_stub_name.c_str()));
 		if (!UserStub)
 			return false;
 
