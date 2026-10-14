@@ -213,11 +213,11 @@ bool ResolveImports(portable_executable::vec_imports imports) {
 			return false;
 
 		for (auto& current_function_data : current_import.function_datas) {
-			ULONG64 function_address = intel_driver::GetKernelModuleExport(Module, current_function_data.name);
+			ULONG64 function_address = vdrv::GetKernelModuleExport(Module, current_function_data.name);
 
 			if (!function_address) {
-				if (Module != intel_driver::ntoskrnlAddr) {
-					function_address = intel_driver::GetKernelModuleExport(intel_driver::ntoskrnlAddr, current_function_data.name);
+				if (Module != vdrv::ntoskrnlAddr) {
+					function_address = vdrv::GetKernelModuleExport(vdrv::ntoskrnlAddr, current_function_data.name);
 					if (!function_address)
 						return false;
 				}
@@ -421,10 +421,10 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 	ULONG64 kernel_image_base = 0;
 	if (mode == AllocationMode::AllocateIndependentPages)
 	{
-		kernel_image_base = intel_driver::MmAllocateIndependentPagesEx(kernel_alloc_size);
+		kernel_image_base = vdrv::MmAllocateIndependentPagesEx(kernel_alloc_size);
 	}
 	else {
-		kernel_image_base = intel_driver::AllocatePool(nt::POOL_TYPE::NonPagedPool, kernel_alloc_size);
+		kernel_image_base = vdrv::AllocatePool(nt::POOL_TYPE::NonPagedPool, kernel_alloc_size);
 	}
 
 	if (!kernel_image_base) {
@@ -432,7 +432,7 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		return 0;
 	}
 
-	intel_driver::ScopedPriorityBoost _mapBoost;
+	vdrv::ScopedPriorityBoost _mapBoost;
 
 	do {
 		memcpy(local_image_base, data, nt_headers->OptionalHeader.SizeOfHeaders);
@@ -485,7 +485,7 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		}
 
 		uint32_t write_size = image_size + ((tramp_used + 0xF) & ~0xF);
-		if (!intel_driver::WriteMemory(realBase, (PVOID)((uintptr_t)local_image_base + (destroyHeader ? TotalVirtualHeaderSize : 0)), write_size)) {
+		if (!vdrv::WriteMemory(realBase, (PVOID)((uintptr_t)local_image_base + (destroyHeader ? TotalVirtualHeaderSize : 0)), write_size)) {
 			kernel_image_base = realBase;
 			break;
 		}
@@ -513,13 +513,13 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 					prot = PAGE_READONLY;
 				}
 
-				intel_driver::MmSetPageProtection(secAddr, secSize, prot);
+				vdrv::MmSetPageProtection(secAddr, secSize, prot);
 			}
 
 			if (tramp_used) {
 				uintptr_t tramp_kaddr = kernel_image_base + nt_headers->OptionalHeader.SizeOfImage;
 				uint32_t tramp_region_size = (tramp_used + 0xFFF) & ~0xFFF;
-				intel_driver::MmSetPageProtection(tramp_kaddr, tramp_region_size, PAGE_EXECUTE_READ);
+				vdrv::MmSetPageProtection(tramp_kaddr, tramp_region_size, PAGE_EXECUTE_READ);
 			}
 		}
 
@@ -533,7 +533,7 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		}
 
 		NTSTATUS status = 0;
-		if (!intel_driver::CallKernelFunction(&status, address_of_entry_point, (PassAllocationAddressAsFirstParam ? realBase : param1), param2)) {
+		if (!vdrv::CallKernelFunction(&status, address_of_entry_point, (PassAllocationAddressAsFirstParam ? realBase : param1), param2)) {
 			kernel_image_base = realBase;
 			break;
 		}
@@ -545,9 +545,9 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 			bool free_status = false;
 
 			if (mode == AllocationMode::AllocateIndependentPages)
-				free_status = intel_driver::MmFreeIndependentPages(realBase, kernel_alloc_size);
+				free_status = vdrv::MmFreeIndependentPages(realBase, kernel_alloc_size);
 			else
-				free_status = intel_driver::FreePool(realBase);
+				free_status = vdrv::FreePool(realBase);
 		}
 
 		VirtualFree(local_image_base, 0, MEM_RELEASE);
@@ -561,9 +561,9 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 	bool free_status = false;
 
 	if (mode == AllocationMode::AllocateIndependentPages)
-		free_status = intel_driver::MmFreeIndependentPages(kernel_image_base, kernel_alloc_size);
+		free_status = vdrv::MmFreeIndependentPages(kernel_image_base, kernel_alloc_size);
 	else
-		free_status = intel_driver::FreePool(kernel_image_base);
+		free_status = vdrv::FreePool(kernel_image_base);
 
 	return 0;
 }

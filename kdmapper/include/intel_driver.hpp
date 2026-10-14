@@ -6,7 +6,7 @@
 #include "utils.hpp"
 #include "nt.hpp"
 
-namespace intel_driver
+namespace vdrv
 {
 	constexpr ULONG32 IOCTL_PHYS_READ_DWORD       = 0x9C412400;
 	constexpr ULONG32 IOCTL_PHYS_READ_WORD        = 0x9C412404;

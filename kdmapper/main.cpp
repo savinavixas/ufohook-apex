@@ -11,8 +11,8 @@
 
 LONG WINAPI SimplestCrashHandler(EXCEPTION_POINTERS* ExceptionInfo)
 {
-	if (intel_driver::hDevice)
-		intel_driver::Unload();
+	if (vdrv::hDevice)
+		vdrv::Unload();
 
 	return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -60,7 +60,7 @@ int wmain(const int argc, wchar_t** argv) {
 	if (!std::filesystem::exists(vulnPath))
 		return -1;
 
-	intel_driver::vulnerableDriverPath = vulnPath;
+	vdrv::vulnerableDriverPath = vulnPath;
 
 	int vulnIdx = paramExists(argc, argv, L"vuln");
 	int vulnValIdx = (vulnIdx > 0 && vulnIdx + 1 < argc) ? vulnIdx + 1 : -1;
@@ -83,12 +83,12 @@ int wmain(const int argc, wchar_t** argv) {
 	if (!std::filesystem::exists(driver_path))
 		return -1;
 
-	if (!NT_SUCCESS(intel_driver::Load()))
+	if (!NT_SUCCESS(vdrv::Load()))
 		return -1;
 
 	std::vector<uint8_t> raw_image = { 0 };
 	if (!kdmUtils::ReadFileToMemory(driver_path, &raw_image)) {
-		intel_driver::Unload();
+		vdrv::Unload();
 		return -1;
 	}
 
@@ -98,11 +98,11 @@ int wmain(const int argc, wchar_t** argv) {
 
 	NTSTATUS exitCode = 0;
 	if (!kdmapper::MapDriver(raw_image.data(), 0, 0, free, !copyHeader, mode, passAllocationPtr, nullptr, &exitCode)) {
-		intel_driver::Unload();
+		vdrv::Unload();
 		return -1;
 	}
 
-	if (!NT_SUCCESS(intel_driver::Unload()))
+	if (!NT_SUCCESS(vdrv::Unload()))
 		return -1;
 
 	return 0;
