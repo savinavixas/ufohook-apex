@@ -150,6 +150,17 @@ namespace intel_driver
 			Function(arguments...);
 		}
 
-		return WriteToReadOnlyMemory(kernel_stub, original_kernel_function, sizeof(kernel_injected_jmp));
+		bool restore_ok = false;
+		for (int rtry = 0; rtry < 3 && !restore_ok; rtry++) {
+			if (WriteToReadOnlyMemory(kernel_stub, original_kernel_function, sizeof(kernel_injected_jmp))) {
+				uint8_t verify[sizeof(kernel_injected_jmp)] = { 0 };
+				if (ReadMemory(kernel_stub, verify, sizeof(verify)) &&
+					memcmp(verify, original_kernel_function, sizeof(verify)) == 0) {
+					restore_ok = true;
+					break;
+				}
+			}
+		}
+		return restore_ok;
 	}
 }
