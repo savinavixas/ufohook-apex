@@ -104,17 +104,11 @@ int wmain(const int argc, wchar_t** argv) {
 
 	std::wstring vulnPath = getParamValue(argc, argv, L"vuln");
 
-	if (vulnPath.empty()) {
-		wchar_t exePath[MAX_PATH];
-		GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-		std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
-		vulnPath = (exeDir / ENCW(L"ArgusMonitor.sys")).wstring();
+	if (!vulnPath.empty()) {
+		if (!std::filesystem::exists(vulnPath))
+			return -1;
+		intel_driver::vulnerableDriverPath = vulnPath;
 	}
-
-	if (!std::filesystem::exists(vulnPath))
-		return -1;
-
-	intel_driver::vulnerableDriverPath = vulnPath;
 
 	int vulnIdx = paramExists(argc, argv, L"vuln");
 	int vulnValIdx = (vulnIdx > 0 && vulnIdx + 1 < argc) ? vulnIdx + 1 : -1;

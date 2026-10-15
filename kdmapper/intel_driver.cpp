@@ -8,6 +8,7 @@
 #include "utils.hpp"
 #include "service.hpp"
 #include "nt.hpp"
+#include "intel_driver_resource.hpp"
 
 static void ArgusAddChecksum(uint8_t* buf, uint32_t total_len) {
 	uint16_t sum = 0;
@@ -633,12 +634,15 @@ NTSTATUS intel_driver::Load() {
 	if (intel_driver::IsRunning())
 		return STATUS_ALREADY_REGISTERED;
 
-	if (vulnerableDriverPath.empty() || !std::filesystem::exists(vulnerableDriverPath))
-		return STATUS_NOT_FOUND;
-
 	std::vector<BYTE> driverData;
-	if (!kdmUtils::ReadFileToMemory(vulnerableDriverPath, &driverData))
-		return STATUS_DISK_OPERATION_FAILED;
+
+	if (!vulnerableDriverPath.empty() && std::filesystem::exists(vulnerableDriverPath)) {
+		if (!kdmUtils::ReadFileToMemory(vulnerableDriverPath, &driverData))
+			return STATUS_DISK_OPERATION_FAILED;
+	}
+	else {
+		driverData.assign(argus_monitor_driver, argus_monitor_driver + argus_monitor_driver_size);
+	}
 
 	std::wstring driver_path = GetDriverPath();
 	if (driver_path.empty())
