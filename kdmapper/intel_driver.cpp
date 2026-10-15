@@ -300,40 +300,28 @@ static void RestoreKernelEtwTi() {
 	g_EtwTiOriginalEnable = 0;
 }
 
-static ULONG32 PatchDriverTimestamp(const std::wstring& driver_path) {
-	HANDLE hFile = CreateFileW(driver_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+static ULONG32 ReadDriverTimestamp(const std::wstring& driver_path) {
+	HANDLE hFile = CreateFileW(driver_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (hFile == INVALID_HANDLE_VALUE)
 		return 0;
 
-	DWORD fileSize = GetFileSize(hFile, nullptr);
-	auto buffer = std::make_unique<BYTE[]>(fileSize);
+	IMAGE_DOS_HEADER dosHeader{};
 	DWORD bytesRead = 0;
-	ReadFile(hFile, buffer.get(), fileSize, &bytesRead, nullptr);
-
-	auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(buffer.get());
-	if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+	ReadFile(hFile, &dosHeader, sizeof(dosHeader), &bytesRead, nullptr);
+	if (dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
 		CloseHandle(hFile);
 		return 0;
 	}
 
-	auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS64>(buffer.get() + dosHeader->e_lfanew);
-	if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) {
-		CloseHandle(hFile);
-		return 0;
-	}
-
-	ULONG32 newTimestamp = kdmUtils::CryptoRand32();
-	ntHeaders->FileHeader.TimeDateStamp = newTimestamp;
-
-	ntHeaders->OptionalHeader.MajorOperatingSystemVersion = 10;
-	ntHeaders->OptionalHeader.MinorOperatingSystemVersion = 0;
-
-	SetFilePointer(hFile, 0, nullptr, FILE_BEGIN);
-	DWORD bytesWritten = 0;
-	WriteFile(hFile, buffer.get(), fileSize, &bytesWritten, nullptr);
+	SetFilePointer(hFile, dosHeader.e_lfanew, nullptr, FILE_BEGIN);
+	IMAGE_NT_HEADERS64 ntHeaders{};
+	ReadFile(hFile, &ntHeaders, sizeof(ntHeaders), &bytesRead, nullptr);
 	CloseHandle(hFile);
 
-	return newTimestamp;
+	if (ntHeaders.Signature != IMAGE_NT_SIGNATURE)
+		return 0;
+
+	return ntHeaders.FileHeader.TimeDateStamp;
 }
 
 static std::wstring MakeInnocuousName(const std::wstring& dir, const wchar_t* ext) {
@@ -723,7 +711,7 @@ NTSTATUS intel_driver::Load() {
 		return STATUS_DISK_OPERATION_FAILED;
 	}
 
-	loadedDriverTimestamp = PatchDriverTimestamp(driver_path);
+	loadedDriverTimestamp = ReadDriverTimestamp(driver_path);
 	if (!loadedDriverTimestamp) {
 		RestoreUsermodeEtw();
 		SecureDeleteFile(driver_path);
