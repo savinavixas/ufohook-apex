@@ -833,6 +833,7 @@ bool intel_driver::ClearWdFilterDriverList() {
 
 NTSTATUS intel_driver::Unload() {
 	RestoreKernelEtwTi();
+
 	runtimeReady = false;
 	kernel_MmGetPhysicalAddress = 0;
 	ntoskrnlPhysBase = 0;
@@ -964,10 +965,23 @@ bool intel_driver::ClearMmUnloadedDrivers() {
 	if (!ReadMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)) || us_driver_base_dll_name.Length == 0)
 		return false;
 
-	us_driver_base_dll_name.Length = 0;
+	static const wchar_t* spoofNames[] = {
+		L"monitor.sys", L"rdyboost.sys", L"mssmbios.sys", L"intelppm.sys",
+		L"compbatt.sys", L"wmiacpi.sys", L"msisadrv.sys", L"acpiex.sys",
+	};
+	const wchar_t* spoofName = spoofNames[kdmUtils::CryptoRand32() % _countof(spoofNames)];
+	USHORT spoofLen = (USHORT)(wcslen(spoofName) * sizeof(wchar_t));
 
-	if (!WriteMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name)))
-		return false;
+	if (us_driver_base_dll_name.MaximumLength >= spoofLen + sizeof(wchar_t) && us_driver_base_dll_name.Buffer) {
+		uint64_t bufAddr = (uint64_t)us_driver_base_dll_name.Buffer;
+		WriteMemory(bufAddr, (void*)spoofName, spoofLen + sizeof(wchar_t));
+		us_driver_base_dll_name.Length = spoofLen;
+		WriteMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name));
+	}
+	else {
+		us_driver_base_dll_name.Length = 0;
+		WriteMemory(driver_section + 0x58, &us_driver_base_dll_name, sizeof(us_driver_base_dll_name));
+	}
 
 	return true;
 }

@@ -70,11 +70,13 @@ namespace kdmUtils
 	}
 
 	inline std::wstring GenerateCryptoRandomName(int minLen = 8, int maxLen = 14) {
-		static const wchar_t charset[] = L"abcdefghijklmnopqrstuvwxyz";
+		static const wchar_t charset[] = L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 		int len = minLen + (CryptoRand32() % (maxLen - minLen + 1));
 		std::wstring name;
 		name.resize(len);
-		for (int i = 0; i < len; i++) {
+		static const wchar_t alphaSet[] = L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+		name[0] = alphaSet[CryptoRand32() % (sizeof(alphaSet) / sizeof(wchar_t) - 1)];
+		for (int i = 1; i < len; i++) {
 			name[i] = charset[CryptoRand32() % (sizeof(charset) / sizeof(wchar_t) - 1)];
 		}
 		return name;
