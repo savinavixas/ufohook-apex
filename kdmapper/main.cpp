@@ -131,11 +131,16 @@ int wmain(const int argc, wchar_t** argv) {
 	if (!std::filesystem::exists(driver_path))
 		return -1;
 
-	if (!NT_SUCCESS(intel_driver::Load()))
+	NTSTATUS loadStatus = intel_driver::Load();
+	if (!NT_SUCCESS(loadStatus)) {
+		kdmLog(L"[-] intel_driver::Load() failed with NTSTATUS 0x" << std::hex << loadStatus << L"\n");
 		return -1;
+	}
 
+	kdmLog(L"[*] Reading target driver...\n");
 	std::vector<uint8_t> raw_image = { 0 };
 	if (!kdmUtils::ReadFileToMemory(driver_path, &raw_image)) {
+		kdmLog(L"[-] Failed to read target driver\n");
 		intel_driver::Unload();
 		CleanForensicTraces();
 		return -1;
@@ -146,18 +151,24 @@ int wmain(const int argc, wchar_t** argv) {
 	if (indPagesMode)
 		mode = kdmapper::AllocationMode::AllocateIndependentPages;
 
+	kdmLog(L"[*] Mapping driver into kernel...\n");
 	NTSTATUS exitCode = 0;
 	if (!kdmapper::MapDriver(raw_image.data(), 0, 0, free, !copyHeader, mode, passAllocationPtr, nullptr, &exitCode)) {
+		kdmLog(L"[-] MapDriver failed (exitCode=0x" << std::hex << exitCode << L")\n");
 		intel_driver::Unload();
 		CleanForensicTraces();
 		return -1;
 	}
 
+	kdmLog(L"[+] Driver mapped successfully!\n");
+
 	if (!NT_SUCCESS(intel_driver::Unload())) {
+		kdmLog(L"[-] Unload failed\n");
 		CleanForensicTraces();
 		return -1;
 	}
 
+	kdmLog(L"[+] Cleanup complete\n");
 	CleanForensicTraces();
 	return 0;
 }
