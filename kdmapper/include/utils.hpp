@@ -83,15 +83,19 @@ namespace kdmUtils
 	}
 
 	inline ULONG GenerateRandomPoolTag() {
-		static const ULONG tags[] = {
-			0x6E664D46,
-			0x6C664D46,
-			0x63694D46,
-			0x4666744E,
-			0x4966744E,
-			0x74536D4D,
-			0x63536343,
+		static const char prefixes[][3] = {
+			"Nt", "Cc", "Mm", "Io", "Ob", "Se", "Cm", "Ex",
+			"Ps", "Lp", "Al", "Fs", "Pp", "Vi", "Wm", "Ke",
 		};
-		return tags[CryptoRand32() % (sizeof(tags) / sizeof(tags[0]))];
+		static const char suffixes[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+		auto& pfx = prefixes[CryptoRand32() % _countof(prefixes)];
+		char tag[4];
+		tag[0] = pfx[0];
+		tag[1] = pfx[1];
+		tag[2] = suffixes[CryptoRand32() % (sizeof(suffixes) - 1)];
+		tag[3] = suffixes[CryptoRand32() % (sizeof(suffixes) - 1)];
+		ULONG result;
+		memcpy(&result, tag, 4);
+		return result;
 	}
 }
