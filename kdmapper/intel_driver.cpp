@@ -150,8 +150,21 @@ std::wstring intel_driver::GetDriverPath() {
 	std::wstring subdir = temp + L"\\" + kdmUtils::GenerateCryptoRandomName(6, 10);
 	CreateDirectoryW(subdir.c_str(), NULL);
 
-	cachedDriverPath = subdir + L"\\" + GetDriverNameW() + L".sys";
+	static const wchar_t* innocuousExts[] = {
+		L".tmp", L".dat", L".bin", L".cache", L".log", L".bak"
+	};
+	const wchar_t* ext = innocuousExts[kdmUtils::CryptoRand32() % _countof(innocuousExts)];
+
+	cachedDriverPath = subdir + L"\\" + GetDriverNameW() + ext;
 	return cachedDriverPath;
+}
+
+std::wstring intel_driver::GetDriverFileNameW() {
+	std::wstring full = GetDriverPath();
+	size_t sep = full.find_last_of(L'\\');
+	if (sep == std::wstring::npos)
+		return GetDriverNameW();
+	return full.substr(sep + 1);
 }
 
 bool intel_driver::IsRunning() {
@@ -1179,10 +1192,14 @@ bool intel_driver::ClearPiDDBCacheTable() {
 	if (!ExAcquireResourceExclusiveLite(PiDDBLock, true))
 		return false;
 
-	auto n = GetDriverNameW();
 	auto timestamp = intel_driver::loadedDriverTimestamp;
 
-	nt::PiDDBCacheEntry* pFoundEntry = (nt::PiDDBCacheEntry*)LookupEntry(PiDDBCacheTable, timestamp, n.c_str());
+	auto nameWithExt = GetDriverFileNameW();
+	nt::PiDDBCacheEntry* pFoundEntry = (nt::PiDDBCacheEntry*)LookupEntry(PiDDBCacheTable, timestamp, nameWithExt.c_str());
+	if (pFoundEntry == nullptr) {
+		auto nameNoExt = GetDriverNameW();
+		pFoundEntry = (nt::PiDDBCacheEntry*)LookupEntry(PiDDBCacheTable, timestamp, nameNoExt.c_str());
+	}
 	if (pFoundEntry == nullptr) {
 		ExReleaseResourceLite(PiDDBLock);
 		return false;

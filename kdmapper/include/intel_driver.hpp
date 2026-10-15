@@ -62,6 +62,7 @@ namespace intel_driver
 	bool ClearMmUnloadedDrivers();
 	std::wstring GetDriverNameW();
 	std::wstring GetDriverPath();
+	std::wstring GetDriverFileNameW();
 
 	template<typename T, typename ...A>
 	bool CallKernelFunction(T* out_result, uint64_t kernel_function_address, const A ...arguments) {
