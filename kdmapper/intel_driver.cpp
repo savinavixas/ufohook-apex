@@ -532,20 +532,25 @@ NTSTATUS intel_driver::Load() {
 
 	_wremove(driver_path.c_str());
 
+	auto* pDos = reinterpret_cast<PIMAGE_DOS_HEADER>(driverData.data());
+	if (driverData.size() < sizeof(IMAGE_DOS_HEADER) || pDos->e_magic != IMAGE_DOS_SIGNATURE) {
+		kdmLog(L"[-] Embedded driver has invalid DOS header\n");
+		return STATUS_INVALID_IMAGE_FORMAT;
+	}
+	auto* pNt = reinterpret_cast<PIMAGE_NT_HEADERS64>(driverData.data() + pDos->e_lfanew);
+	if (pNt->Signature != IMAGE_NT_SIGNATURE) {
+		kdmLog(L"[-] Embedded driver has invalid PE signature\n");
+		return STATUS_INVALID_IMAGE_FORMAT;
+	}
+	loadedDriverTimestamp = pNt->FileHeader.TimeDateStamp;
+	kdmLog(L"[*] Original driver timestamp: 0x" << std::hex << loadedDriverTimestamp << L"\n");
+
 	PatchUsermodeEtw();
 
 	if (!kdmUtils::CreateFileFromMemory(driver_path, reinterpret_cast<const char*>(driverData.data()), driverData.size())) {
 		kdmLog(L"[-] Failed to write driver to disk\n");
 		RestoreUsermodeEtw();
 		return STATUS_DISK_OPERATION_FAILED;
-	}
-
-	loadedDriverTimestamp = PatchDriverTimestamp(driver_path);
-	if (!loadedDriverTimestamp) {
-		kdmLog(L"[-] Failed to patch driver timestamp\n");
-		RestoreUsermodeEtw();
-		SecureDeleteFile(driver_path);
-		return STATUS_UNSUCCESSFUL;
 	}
 
 	auto status = AcquireDebugPrivilege();
