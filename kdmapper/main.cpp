@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 #include <filesystem>
+#include <memory>
+#include <Sddl.h>
 
 #include "kdmapper.hpp"
 #include "utils.hpp"
@@ -15,6 +17,61 @@ LONG WINAPI SimplestCrashHandler(EXCEPTION_POINTERS* ExceptionInfo)
 		intel_driver::Unload();
 
 	return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void CleanForensicTraces() {
+	wchar_t exePath[MAX_PATH];
+	if (!GetModuleFileNameW(nullptr, exePath, MAX_PATH))
+		return;
+
+	std::wstring exeName = std::filesystem::path(exePath).filename().wstring();
+	for (auto& c : exeName) c = (wchar_t)towupper(c);
+
+	try {
+		for (auto& entry : std::filesystem::directory_iterator(L"C:\\Windows\\Prefetch")) {
+			std::wstring fn = entry.path().filename().wstring();
+			for (auto& c : fn) c = (wchar_t)towupper(c);
+			if (fn.find(exeName) == 0 && fn.find(L".PF") != std::wstring::npos)
+				DeleteFileW(entry.path().wstring().c_str());
+		}
+	} catch (...) {}
+
+	HANDLE hToken = NULL;
+	if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+		DWORD len = 0;
+		GetTokenInformation(hToken, TokenUser, nullptr, 0, &len);
+		if (len) {
+			auto buf = std::make_unique<BYTE[]>(len);
+			if (GetTokenInformation(hToken, TokenUser, buf.get(), len, &len)) {
+				LPWSTR sid = nullptr;
+				if (ConvertSidToStringSidW(reinterpret_cast<PTOKEN_USER>(buf.get())->User.Sid, &sid)) {
+					wchar_t volRoot[MAX_PATH], devName[MAX_PATH];
+					if (GetVolumePathNameW(exePath, volRoot, MAX_PATH)) {
+						std::wstring vol(volRoot);
+						if (!vol.empty() && vol.back() == L'\\') vol.pop_back();
+						if (QueryDosDeviceW(vol.c_str(), devName, MAX_PATH)) {
+							std::wstring devExe = std::wstring(devName) + (exePath + vol.size());
+
+							const wchar_t* subkeys[] = {
+								L"SYSTEM\\CurrentControlSet\\Services\\bam\\State\\UserSettings\\",
+								L"SYSTEM\\CurrentControlSet\\Services\\dam\\State\\UserSettings\\",
+							};
+							for (auto prefix : subkeys) {
+								std::wstring keyPath = std::wstring(prefix) + sid;
+								HKEY hKey;
+								if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+									RegDeleteValueW(hKey, devExe.c_str());
+									RegCloseKey(hKey);
+								}
+							}
+						}
+					}
+					LocalFree(sid);
+				}
+			}
+		}
+		CloseHandle(hToken);
+	}
 }
 
 int paramExists(const int argc, wchar_t** argv, const wchar_t* param) {
@@ -86,6 +143,7 @@ int wmain(const int argc, wchar_t** argv) {
 	std::vector<uint8_t> raw_image = { 0 };
 	if (!kdmUtils::ReadFileToMemory(driver_path, &raw_image)) {
 		intel_driver::Unload();
+		CleanForensicTraces();
 		return -1;
 	}
 
@@ -97,12 +155,16 @@ int wmain(const int argc, wchar_t** argv) {
 	NTSTATUS exitCode = 0;
 	if (!kdmapper::MapDriver(raw_image.data(), 0, 0, free, !copyHeader, mode, passAllocationPtr, nullptr, &exitCode)) {
 		intel_driver::Unload();
+		CleanForensicTraces();
 		return -1;
 	}
 
-	if (!NT_SUCCESS(intel_driver::Unload()))
+	if (!NT_SUCCESS(intel_driver::Unload())) {
+		CleanForensicTraces();
 		return -1;
+	}
 
+	CleanForensicTraces();
 	return 0;
 }
 

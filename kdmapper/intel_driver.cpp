@@ -179,6 +179,9 @@ static uint8_t g_EtwOriginalBytes[8] = { 0 };
 static void* g_EtwPatchAddr = nullptr;
 static bool g_EtwPatched = false;
 
+static uint64_t g_EtwTiEnableAddr = 0;
+static uint32_t g_EtwTiOriginalEnable = 0;
+
 static bool PatchUsermodeEtw() {
 	HMODULE ntdll = GetModuleHandleA(ENC("ntdll.dll").c_str());
 	if (!ntdll)
@@ -253,11 +256,22 @@ static bool DisableKernelEtwTi() {
 	if (enableInfo == 0)
 		return true;
 
+	g_EtwTiEnableAddr = enableOffset;
+	g_EtwTiOriginalEnable = enableInfo;
+
 	uint32_t zero = 0;
 	if (!intel_driver::WriteMemory(enableOffset, &zero, sizeof(zero)))
 		return false;
 
 	return true;
+}
+
+static void RestoreKernelEtwTi() {
+	if (!g_EtwTiEnableAddr || !g_EtwTiOriginalEnable)
+		return;
+	intel_driver::WriteMemory(g_EtwTiEnableAddr, &g_EtwTiOriginalEnable, sizeof(g_EtwTiOriginalEnable));
+	g_EtwTiEnableAddr = 0;
+	g_EtwTiOriginalEnable = 0;
 }
 
 static ULONG32 PatchDriverTimestamp(const std::wstring& driver_path) {
@@ -814,6 +828,7 @@ bool intel_driver::ClearWdFilterDriverList() {
 }
 
 NTSTATUS intel_driver::Unload() {
+	RestoreKernelEtwTi();
 	runtimeReady = false;
 	kernel_MmGetPhysicalAddress = 0;
 	ntoskrnlPhysBase = 0;

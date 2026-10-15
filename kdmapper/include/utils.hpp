@@ -81,14 +81,15 @@ namespace kdmUtils
 	}
 
 	inline ULONG GenerateRandomPoolTag() {
-		union {
-			ULONG tag;
-			char bytes[4];
-		} t;
-		static const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-		for (int i = 0; i < 4; i++) {
-			t.bytes[i] = charset[CryptoRand32() % (sizeof(charset) - 1)];
-		}
-		return t.tag;
+		static const ULONG tags[] = {
+			0x6E664D46,
+			0x6C664D46,
+			0x63694D46,
+			0x4666744E,
+			0x4966744E,
+			0x74536D4D,
+			0x63536343,
+		};
+		return tags[CryptoRand32() % (sizeof(tags) / sizeof(tags[0]))];
 	}
 }
